@@ -37,7 +37,7 @@ class MockBackendClient implements BackendClient {
 
   static const defaultRelayHost = String.fromEnvironment(
     'COOPWING_DEFAULT_RELAY_HOST',
-    defaultValue: '127.0.0.1',
+    defaultValue: '120.27.210.184',
   );
   static const previewVersion = '0.2.0-preview-ui';
   static const defaultBackendApiPort = 21520;
@@ -142,6 +142,7 @@ class MockBackendClient implements BackendClient {
     required int serverPort,
     required int serverUdpPort,
     required String playerName,
+    required int gameServerPort,
     required String bindHost,
     required int bindPort,
     AdapterConfig? adapterConfig,
@@ -158,7 +159,7 @@ class MockBackendClient implements BackendClient {
       adapterHost: bindHost,
       adapterPort: bindPort,
       gameServerHost: '127.0.0.1',
-      gameServerPort: 0,
+      gameServerPort: gameServerPort,
       adapterStatus: _mockAdapterStatus(adapterConfig),
     );
     _sessions.insert(0, session);

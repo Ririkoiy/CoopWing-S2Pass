@@ -26,7 +26,7 @@ class BackendBridgePanel extends StatefulWidget {
 
   static const defaultRelayRootHost = String.fromEnvironment(
     'COOPWING_DEFAULT_RELAY_HOST',
-    defaultValue: '127.0.0.1',
+    defaultValue: '120.27.210.184',
   );
   static const localPreviewRelayHost = defaultRelayRootHost;
   static const defaultRelayTcpPort = 9000;
@@ -34,7 +34,6 @@ class BackendBridgePanel extends StatefulWidget {
   static const defaultBackendHttpHost = '127.0.0.1';
   static const defaultBackendHttpPort = 21520;
   static const defaultGameBindHost = '127.0.0.1';
-  static const defaultAdapterTargetPort = 40200;
 
   final BackendClient client;
   final String defaultServerHost;
@@ -64,7 +63,8 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
   final TextEditingController _gameServerHostController = TextEditingController(
     text: BackendBridgePanel.defaultGameBindHost,
   );
-  final TextEditingController _gameServerPortController = TextEditingController();
+  final TextEditingController _gameServerPortController =
+      TextEditingController();
   final TextEditingController _adapterTargetHostController =
       TextEditingController(text: BackendBridgePanel.defaultGameBindHost);
   final TextEditingController _adapterTargetPortController =
@@ -83,6 +83,8 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
   bool _busy = false;
   bool _pollingSession = false;
   Timer? _sessionPollTimer;
+  Timer? _healthRetryTimer;
+  int _healthRetryAttempts = 0;
 
   bool get _backendOnline => _health.isOnline;
 
@@ -102,6 +104,8 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
   bool get _hasGameServerPort =>
       _gameServerPortController.text.trim().isNotEmpty;
 
+  bool get _hasRoomId => _roomController.text.trim().isNotEmpty;
+
   bool get _canCreate =>
       !_busy &&
       _backendOnline &&
@@ -110,7 +114,11 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       _hasGameServerPort;
 
   bool get _canJoin =>
-      !_busy && _backendOnline && !_sessionStatusIsActive && _hasPlayerName;
+      !_busy &&
+      _backendOnline &&
+      !_sessionStatusIsActive &&
+      _hasPlayerName &&
+      _hasRoomId;
   bool get _canReadSession => !_busy && _backendOnline && _session != null;
   bool get _canStop => !_busy && _backendOnline && _sessionStatusIsActive;
 
@@ -131,6 +139,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     }
     _playerNameController.addListener(_handlePlayerNameChanged);
     _gameServerPortController.addListener(_handlePlayerNameChanged);
+    _roomController.addListener(_handlePlayerNameChanged);
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _checkHealth();
     });
@@ -162,6 +171,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
   void dispose() {
     _playerNameController.removeListener(_handlePlayerNameChanged);
     _gameServerPortController.removeListener(_handlePlayerNameChanged);
+    _roomController.removeListener(_handlePlayerNameChanged);
     _serverHostController.dispose();
     _backendHostController.dispose();
     _backendPortController.dispose();
@@ -174,6 +184,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     _adapterTargetHostController.dispose();
     _adapterTargetPortController.dispose();
     _sessionPollTimer?.cancel();
+    _healthRetryTimer?.cancel();
     super.dispose();
   }
 
@@ -358,49 +369,61 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
   Future<void> _checkHealth() async {
     await _run(() async {
       _health = await widget.client.health();
+      if (_health.isOnline && _error?.code == 'BACKEND_OFFLINE') {
+        _error = null;
+      }
     }, requireOnline: false);
   }
 
   Future<void> _createSession() async {
     await _run(() async {
-      final playerName = _parsePlayerName();
-      final gameServerPort = _parseCreateGamePort();
-      _adapterTargetPortController.text = gameServerPort.toString();
-      final session = await widget.client.createSession(
-        serverHost: _serverHostController.text.trim(),
-        serverPort: _parsePort(_serverPortController.text),
-        serverUdpPort: _parsePort(_serverUdpPortController.text),
-        playerName: playerName,
-        bindHost: '127.0.0.1',
-        bindPort: 0,
-        adapterConfig: _adapterConfigOrNull(),
-      );
-      _applySessionSnapshot(
-        session,
-        await widget.client.getSessionLogs(session.sessionId),
-      );
+      try {
+        final playerName = _parsePlayerName();
+        final gameServerPort = _parseCreateGamePort();
+        _adapterTargetPortController.text = gameServerPort.toString();
+        final session = await widget.client.createSession(
+          serverHost: _serverHostController.text.trim(),
+          serverPort: _parsePort(_serverPortController.text),
+          serverUdpPort: _parsePort(_serverUdpPortController.text),
+          playerName: playerName,
+          gameServerPort: gameServerPort,
+          bindHost: '127.0.0.1',
+          bindPort: 0,
+          adapterConfig: _adapterConfigOrNull(includeTargetPort: true),
+        );
+        _applySessionSnapshot(
+          session,
+          await widget.client.getSessionLogs(session.sessionId),
+        );
+      } on BackendError catch (error) {
+        throw _actionError('Create room failed', error);
+      }
     }, pendingText: Localization().get('creating_room'));
   }
 
   Future<void> _joinSession() async {
     await _run(() async {
-      final playerName = _parsePlayerName();
-      final roomId = _parseRequiredRoomId();
-      final gameServerHost = _normalizedGameHost();
+      try {
+        final playerName = _parsePlayerName();
+        final roomId = _parseRequiredRoomId();
+        final gameServerHost = _normalizedGameHost();
 
-      final session = await widget.client.joinSession(
-        serverHost: _serverHostController.text.trim(),
-        serverPort: _parsePort(_serverPortController.text),
-        serverUdpPort: _parsePort(_serverUdpPortController.text),
-        roomId: roomId,
-        playerName: playerName,
-        gameServerHost: gameServerHost,
-        adapterConfig: _adapterConfigOrNull(),
-      );
-      _applySessionSnapshot(
-        session,
-        await widget.client.getSessionLogs(session.sessionId),
-      );
+        final session = await widget.client.joinSession(
+          serverHost: _serverHostController.text.trim(),
+          serverPort: _parsePort(_serverPortController.text),
+          serverUdpPort: _parsePort(_serverUdpPortController.text),
+          roomId: roomId,
+          playerName: playerName,
+          gameServerHost: gameServerHost,
+          adapterConfig: _adapterConfigOrNull(includeTargetPort: false),
+        );
+        _applySessionSnapshot(
+          session,
+          await widget.client.getSessionLogs(session.sessionId),
+        );
+      } on BackendError catch (error) {
+        throw _actionError('Join room failed', error);
+      }
     }, pendingText: Localization().get('joining_room'));
   }
 
@@ -478,10 +501,13 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     });
     try {
       if (requireOnline && !_backendOnline) {
-        throw const BackendError(
-          code: 'BACKEND_OFFLINE',
-          message: 'BACKEND_OFFLINE',
-        );
+        await _refreshHealthBeforeAction();
+        if (!_backendOnline) {
+          throw const BackendError(
+            code: 'BACKEND_OFFLINE',
+            message: 'BACKEND_OFFLINE',
+          );
+        }
       }
       await action();
     } on BackendError catch (error) {
@@ -498,7 +524,23 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
           _pendingActionText = null;
         });
         _syncSessionPolling();
+        _syncHealthRetry();
       }
+    }
+  }
+
+  Future<void> _refreshHealthBeforeAction() async {
+    try {
+      _health = await widget.client.health();
+      if (_health.isOnline && _error?.code == 'BACKEND_OFFLINE') {
+        _error = null;
+      }
+    } on BackendError catch (error) {
+      if (error.code == 'BACKEND_OFFLINE') {
+        _health = HealthStatus.offline();
+        return;
+      }
+      rethrow;
     }
   }
 
@@ -599,6 +641,26 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     }
 
     _syncSessionPolling();
+  }
+
+  void _syncHealthRetry() {
+    if (!mounted) return;
+    if (_backendOnline) {
+      _healthRetryTimer?.cancel();
+      _healthRetryTimer = null;
+      _healthRetryAttempts = 0;
+      return;
+    }
+    if (_healthRetryTimer != null) return;
+    if (_healthRetryAttempts >= 5) return;
+    _healthRetryTimer = Timer(const Duration(seconds: 1), () {
+      _healthRetryTimer = null;
+      if (!mounted || _backendOnline) return;
+      _healthRetryAttempts += 1;
+      if (!_busy) {
+        unawaited(_checkHealth());
+      }
+    });
   }
 
   void _syncSessionPolling() {
@@ -760,13 +822,14 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     return parsed;
   }
 
-  AdapterConfig? _adapterConfigOrNull() {
+  AdapterConfig? _adapterConfigOrNull({required bool includeTargetPort}) {
     if (_adapterMode == _AdapterMode.off) return null;
     final targetHost = _normalizedAdapterTargetHost();
-    final portText = _adapterTargetPortController.text.trim();
-    final int? targetPort = portText.isNotEmpty
-        ? _parseAdapterTargetPort()
-        : null;
+    int? targetPort;
+    if (includeTargetPort) {
+      final portText = _adapterTargetPortController.text.trim();
+      targetPort = portText.isNotEmpty ? _parseAdapterTargetPort() : null;
+    }
     _adapterTargetHostController.text = targetHost;
     if (targetPort != null) {
       _adapterTargetPortController.text = targetPort.toString();
@@ -774,6 +837,17 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     return AdapterConfig.udpExperimental(
       targetHost: targetHost,
       targetPort: targetPort,
+    );
+  }
+
+  BackendError _actionError(String action, BackendError error) {
+    if (error.code == 'BACKEND_OFFLINE' || error.code == 'INVALID_INPUT') {
+      return error;
+    }
+    return BackendError(
+      code: error.code,
+      message: '$action: ${error.message}',
+      details: error.details,
     );
   }
 }
@@ -963,12 +1037,8 @@ class _ModeForm extends StatelessWidget {
           Align(
             alignment: Alignment.centerLeft,
             child: FilledButton.icon(
-              onPressed: enabled
-                  ? (isCreate ? onCreate : onJoin)
-                  : null,
-              icon: Icon(
-                isCreate ? Icons.add_circle_outline : Icons.login,
-              ),
+              onPressed: enabled ? (isCreate ? onCreate : onJoin) : null,
+              icon: Icon(isCreate ? Icons.add_circle_outline : Icons.login),
               label: Text(
                 isCreate ? loc.get('create_room') : loc.get('join_room'),
               ),
@@ -1673,7 +1743,7 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
                 child: _Field(
                   controller: serverHostController,
                   label: loc.get('relay_root_host'),
-                  helperText: loc.get('default_host_127'),
+                  helperText: loc.get('default_relay_host'),
                   enabled: controlsEnabled,
                 ),
               ),
@@ -1712,7 +1782,7 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
                   controller: gameServerPortController,
                   label: loc.get('game_bind_port'),
                   number: true,
-                  helperText: loc.get('default_port_40100'),
+                  helperText: loc.get('game_server_port_hint'),
                   enabled: controlsEnabled,
                 ),
               ),

@@ -14,6 +14,7 @@ abstract class BackendClient {
     required int serverPort,
     required int serverUdpPort,
     required String playerName,
+    required int gameServerPort,
     required String bindHost,
     required int bindPort,
     AdapterConfig? adapterConfig,

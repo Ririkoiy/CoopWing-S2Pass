@@ -41,6 +41,7 @@ void main() {
       ),
       findsOneWidget,
     );
+    expect(find.text('120.27.210.184'), findsOneWidget);
 
     await tester.enterText(
       find.widgetWithText(TextField, 'Default Relay/root host (default_relay)'),

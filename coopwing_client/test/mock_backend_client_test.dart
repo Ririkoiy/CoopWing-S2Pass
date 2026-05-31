@@ -18,6 +18,7 @@ void main() {
     expect(settings.backendApiPort, 21520);
 
     final servers = await client.getServers();
+    expect(MockBackendClient.defaultRelayHost, '120.27.210.184');
     expect(servers.single.host, MockBackendClient.defaultRelayHost);
 
     final profiles = await client.getProfiles();
@@ -95,6 +96,7 @@ void main() {
       serverPort: 9000,
       serverUdpPort: 9001,
       playerName: 'CreatorA',
+      gameServerPort: 27015,
       bindHost: '127.0.0.1',
       bindPort: 0,
     );

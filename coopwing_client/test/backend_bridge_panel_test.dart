@@ -141,6 +141,17 @@ void main() {
     expect(find.widgetWithText(FilledButton, 'Create Room'), findsNothing);
     expect(find.widgetWithText(FilledButton, 'Join Room'), findsOneWidget);
     expect(find.text('Room ID'), findsOneWidget);
+    final partialJoinButton = tester.widget<FilledButton>(
+      find.widgetWithText(FilledButton, 'Join Room'),
+    );
+    expect(partialJoinButton.onPressed, isNull);
+
+    await tester.enterText(find.widgetWithText(TextField, 'Room ID'), 'MOCK42');
+    await tester.pump();
+    final enabledJoinButton = tester.widget<FilledButton>(
+      find.widgetWithText(FilledButton, 'Join Room'),
+    );
+    expect(enabledJoinButton.onPressed, isNotNull);
   });
 
   testWidgets('Active session hides create join controls', (tester) async {
@@ -265,6 +276,25 @@ void main() {
     expect(find.textContaining('Backend offline'), findsOneWidget);
   });
 
+  testWidgets('Refresh health updates reachable backend to online real_core', (
+    tester,
+  ) async {
+    final client = _SwitchableHealthMockClient()..online = false;
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('offline'), findsOneWidget);
+
+    client.online = true;
+    await tester.tap(find.byIcon(Icons.refresh));
+    await tester.pumpAndSettle();
+
+    expect(find.text('online real_core'), findsOneWidget);
+    expect(find.textContaining('Backend offline'), findsNothing);
+  });
+
   testWidgets('Reset clears room id and returns to create mode', (
     tester,
   ) async {
@@ -278,6 +308,7 @@ void main() {
     await tester.tap(find.text('Join Room'));
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextField, 'Room ID'), 'MOCK42');
+    await tester.pump();
     await tester.tap(find.widgetWithText(FilledButton, 'Join Room'));
     await tester.pumpAndSettle();
 
@@ -376,7 +407,7 @@ void main() {
     expect(find.widgetWithText(TextField, 'Room ID'), findsOneWidget);
   });
 
-  testWidgets('Advanced settings show local preview defaults', (tester) async {
+  testWidgets('Advanced settings show release relay defaults', (tester) async {
     final client = MockBackendClient();
     addTearDown(client.dispose);
 
@@ -392,6 +423,8 @@ void main() {
     expect(find.widgetWithText(TextField, 'Relay/root host'), findsOneWidget);
     expect(find.widgetWithText(TextField, 'Relay TCP port'), findsOneWidget);
     expect(find.widgetWithText(TextField, 'Relay UDP port'), findsOneWidget);
+    expect(find.text('120.27.210.184'), findsOneWidget);
+    expect(find.text('Default 120.27.210.184'), findsOneWidget);
     expect(find.text('127.0.0.1'), findsWidgets);
     expect(find.text('9000'), findsOneWidget);
     expect(find.text('9001'), findsOneWidget);
@@ -422,6 +455,7 @@ void main() {
       client.lastCreateServerUdpPort,
       BackendBridgePanel.defaultRelayUdpPort,
     );
+    expect(client.lastCreateGameServerPort, 27015);
     final config = client.lastCreateAdapterConfig!;
     expect(config.enabled, isTrue);
     expect(config.adapterType, 'local_udp_bridge');
@@ -444,6 +478,7 @@ void main() {
     await tester.tap(find.text('Join Room'));
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextField, 'Room ID'), 'MOCK42');
+    await tester.pump();
     await tester.tap(find.widgetWithText(FilledButton, 'Join Room'));
     await tester.pumpAndSettle();
 
@@ -542,7 +577,7 @@ void main() {
         bindHost: '127.0.0.1',
         bindPort: 40100,
         targetHost: '127.0.0.1',
-        targetPort: 40200,
+        targetPort: 27015,
         counters: AdapterCounters(
           packetsFromGame: 6,
           packetsToTransport: 6,
@@ -555,7 +590,7 @@ void main() {
         'Local connection address',
         '127.0.0.1:40100',
         'Game server address',
-        '127.0.0.1:40200',
+        '127.0.0.1:27015',
         'The VPS/Relay address is for CoopWing only. Do not put it directly into the game connect command.',
         'Game clients should connect to the local connection address, for example connect 127.0.0.1:40100',
         'Realtime Traffic',
@@ -578,7 +613,7 @@ void main() {
         bindHost: '127.0.0.1',
         bindPort: 40100,
         targetHost: '127.0.0.1',
-        targetPort: 40200,
+        targetPort: 27015,
         counters: AdapterCounters(
           packetsFromGame: 0,
           packetsToTransport: 0,
@@ -708,7 +743,7 @@ void main() {
         bindHost: '127.0.0.1',
         bindPort: 40100,
         targetHost: '127.0.0.1',
-        targetPort: 40200,
+        targetPort: 27015,
         counters: AdapterCounters(
           packetsFromGame: 0,
           packetsToTransport: 0,
@@ -769,6 +804,7 @@ class _CapturingMockClient extends MockBackendClient {
   String? lastCreateServerHost;
   int? lastCreateServerPort;
   int? lastCreateServerUdpPort;
+  int? lastCreateGameServerPort;
   AdapterConfig? lastCreateAdapterConfig;
   String? lastJoinServerHost;
   int? lastJoinServerPort;
@@ -781,6 +817,7 @@ class _CapturingMockClient extends MockBackendClient {
     required int serverPort,
     required int serverUdpPort,
     required String playerName,
+    required int gameServerPort,
     required String bindHost,
     required int bindPort,
     AdapterConfig? adapterConfig,
@@ -788,12 +825,14 @@ class _CapturingMockClient extends MockBackendClient {
     lastCreateServerHost = serverHost;
     lastCreateServerPort = serverPort;
     lastCreateServerUdpPort = serverUdpPort;
+    lastCreateGameServerPort = gameServerPort;
     lastCreateAdapterConfig = adapterConfig;
     return super.createSession(
       serverHost: serverHost,
       serverPort: serverPort,
       serverUdpPort: serverUdpPort,
       playerName: playerName,
+      gameServerPort: gameServerPort,
       bindHost: bindHost,
       bindPort: bindPort,
       adapterConfig: adapterConfig,
@@ -836,7 +875,13 @@ class _SwitchableHealthMockClient extends MockBackendClient {
     if (!online) {
       return HealthStatus.offline();
     }
-    return super.health();
+    return const HealthStatus(
+      status: 'ok',
+      version: '0.1.0',
+      uptimeSeconds: 1,
+      backend: 's2pass',
+      mode: 'real_core',
+    );
   }
 }
 
@@ -850,6 +895,7 @@ class _StaleCreateRoomMockClient extends MockBackendClient {
     required int serverPort,
     required int serverUdpPort,
     required String playerName,
+    required int gameServerPort,
     required String bindHost,
     required int bindPort,
     AdapterConfig? adapterConfig,
@@ -995,6 +1041,7 @@ class _AdapterStatusMockClient extends MockBackendClient {
     required int serverPort,
     required int serverUdpPort,
     required String playerName,
+    required int gameServerPort,
     required String bindHost,
     required int bindPort,
     AdapterConfig? adapterConfig,

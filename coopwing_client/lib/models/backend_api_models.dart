@@ -359,7 +359,7 @@ class SessionInfo {
       adapterHost: json['adapter_host'] as String? ?? '127.0.0.1',
       adapterPort: json['adapter_port'] as int? ?? 0,
       gameServerHost: json['game_server_host'] as String? ?? '127.0.0.1',
-      gameServerPort: json['game_server_port'] as int? ?? 0,
+      gameServerPort: _nullableAsInt(json['game_server_port']),
       createdAt: json['created_at'] as num? ?? 0,
       updatedAt: json['updated_at'] as num? ?? 0,
       stats: statsJson == null
@@ -385,7 +385,7 @@ class SessionInfo {
       'adapter_host': adapterHost,
       'adapter_port': adapterPort,
       'game_server_host': gameServerHost,
-      'game_server_port': gameServerPort,
+      if (gameServerPort != null) 'game_server_port': gameServerPort,
       'created_at': createdAt,
       'updated_at': updatedAt,
       'stats': stats.toJson(),

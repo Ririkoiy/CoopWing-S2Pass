@@ -115,12 +115,14 @@ void main() {
           serverPort: 9000,
           serverUdpPort: 9001,
           playerName: 'Alice',
+          gameServerPort: 27015,
           bindHost: '127.0.0.1',
           bindPort: 0,
         );
       });
 
       expect(capture.path, '/sessions/create');
+      expect(capture.body['game_server_port'], 27015);
       expect(capture.body.containsKey('adapter_config'), isFalse);
     });
 
@@ -135,29 +137,45 @@ void main() {
             roomId: 'ABC234',
             playerName: 'Bob',
             gameServerHost: '127.0.0.1',
-            gameServerPort: 40100,
             adapterConfig: const AdapterConfig(
               enabled: true,
               adapterType: 'local_udp_bridge',
               bindHost: '127.0.0.1',
               bindPort: 0,
               targetHost: '127.0.0.1',
-              targetPort: 40200,
             ),
           );
         });
 
         expect(capture.path, '/sessions/join');
+        expect(capture.body.containsKey('game_server_port'), isFalse);
         expect(capture.body['adapter_config'], {
           'enabled': true,
           'adapter_type': 'local_udp_bridge',
           'bind_host': '127.0.0.1',
           'bind_port': 0,
           'target_host': '127.0.0.1',
-          'target_port': 40200,
         });
       },
     );
+  });
+
+  test('HTTP 400 validation errors preserve backend error code', () async {
+    final error = await _withErrorServer((client) {
+      return client.createSession(
+        serverHost: '127.0.0.1',
+        serverPort: 9000,
+        serverUdpPort: 9001,
+        playerName: 'Alice',
+        gameServerPort: 27015,
+        bindHost: '127.0.0.1',
+        bindPort: 0,
+      );
+    });
+
+    expect(error.code, 'INVALID_REQUEST');
+    expect(error.message, 'game_server_port required');
+    expect(error.code, isNot('BACKEND_OFFLINE'));
   });
 
   test(
@@ -227,6 +245,41 @@ Future<_CapturedRequest> _withCaptureServer(
   try {
     await action(client);
     return captured.future;
+  } finally {
+    client.dispose();
+    await subscription.cancel();
+    await server.close(force: true);
+  }
+}
+
+Future<BackendError> _withErrorServer(
+  Future<SessionInfo> Function(HttpBackendClient client) action,
+) async {
+  final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+  final subscription = server.listen((request) async {
+    await utf8.decoder.bind(request).join();
+    request.response.statusCode = HttpStatus.badRequest;
+    request.response.headers.contentType = ContentType.json;
+    request.response.write(
+      jsonEncode({
+        'error': {
+          'code': 'INVALID_REQUEST',
+          'message': 'game_server_port required',
+        },
+      }),
+    );
+    await request.response.close();
+  });
+  final client = HttpBackendClient(
+    baseUrl: 'http://127.0.0.1:${server.port}',
+    timeout: const Duration(seconds: 5),
+  );
+
+  try {
+    await action(client);
+    fail('Expected BackendError');
+  } on BackendError catch (error) {
+    return error;
   } finally {
     client.dispose();
     await subscription.cancel();

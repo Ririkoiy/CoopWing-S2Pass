@@ -8,6 +8,8 @@ from typing import Any, Dict, List, Optional
 
 
 ADAPTER_TYPE_LOCAL_UDP_BRIDGE = "local_udp_bridge"
+ADAPTER_TYPE_TCP_FORWARD = "tcp_forward"
+_VALID_ADAPTER_TYPES = {ADAPTER_TYPE_LOCAL_UDP_BRIDGE, ADAPTER_TYPE_TCP_FORWARD}
 ADAPTER_STATUS_DISABLED = "disabled"
 ADAPTER_STATUS_INITIALIZING = "initializing"
 ADAPTER_STATUS_READY = "ready"
@@ -51,9 +53,7 @@ class AdapterConfig:
     bind_host: str = "127.0.0.1"
     bind_port: int = 0
     target_host: str = "127.0.0.1"
-    # P5.0B follows the P4.7C status examples: 40200 is the default local
-    # game target port, while bind_port=0 remains OS-assigned for future bind.
-    target_port: int = 40200
+    target_port: Optional[int] = None
 
     @classmethod
     def from_dict(cls, raw: Dict[str, Any]) -> "AdapterConfig":
@@ -66,14 +66,14 @@ class AdapterConfig:
 
         enabled = _adapter_bool(raw, "enabled", cls.enabled)
         adapter_type = _adapter_str(raw, "adapter_type", cls.adapter_type)
-        if adapter_type != ADAPTER_TYPE_LOCAL_UDP_BRIDGE:
+        if adapter_type not in _VALID_ADAPTER_TYPES:
             raise BackendError(
                 code="INVALID_REQUEST",
                 message=f"Unsupported adapter_config.adapter_type: {adapter_type}",
                 details={
                     "field": "adapter_config.adapter_type",
                     "value": adapter_type,
-                    "expected": ADAPTER_TYPE_LOCAL_UDP_BRIDGE,
+                    "valid": sorted(_VALID_ADAPTER_TYPES),
                 },
             )
 
@@ -83,18 +83,20 @@ class AdapterConfig:
             bind_host=_adapter_str(raw, "bind_host", cls.bind_host),
             bind_port=_adapter_port(raw, "bind_port", cls.bind_port),
             target_host=_adapter_str(raw, "target_host", cls.target_host),
-            target_port=_adapter_port(raw, "target_port", cls.target_port),
+            target_port=_optional_adapter_port(raw, "target_port"),
         )
 
     def to_dict(self) -> Dict[str, Any]:
-        return {
+        d: Dict[str, Any] = {
             "enabled": self.enabled,
             "adapter_type": self.adapter_type,
             "bind_host": self.bind_host,
             "bind_port": self.bind_port,
             "target_host": self.target_host,
-            "target_port": self.target_port,
         }
+        if self.target_port is not None:
+            d["target_port"] = self.target_port
+        return d
 
 
 @dataclasses.dataclass
@@ -129,7 +131,7 @@ class AdapterStatus:
     bind_host: str = "127.0.0.1"
     bind_port: int = 0
     target_host: str = "127.0.0.1"
-    target_port: int = 40200
+    target_port: Optional[int] = None
     counters: AdapterCounters = dataclasses.field(default_factory=AdapterCounters)
     error: Optional[Dict[str, str]] = None
 
@@ -170,10 +172,11 @@ class AdapterStatus:
                 "bind_host": self.bind_host,
                 "bind_port": self.bind_port,
                 "target_host": self.target_host,
-                "target_port": self.target_port,
                 "counters": self.counters.to_dict(),
                 "error": self.error,
             })
+            if self.target_port is not None:
+                d["target_port"] = self.target_port
         return d
 
 
@@ -225,7 +228,7 @@ class SessionInfo:
     adapter_host: str = "127.0.0.1"
     adapter_port: int = 0
     game_server_host: str = "127.0.0.1"
-    game_server_port: int = 0
+    game_server_port: Optional[int] = None
     created_at: float = 0.0
     updated_at: float = 0.0
     error: Optional[Dict[str, Any]] = None
@@ -246,10 +249,11 @@ class SessionInfo:
             "adapter_host": self.adapter_host,
             "adapter_port": self.adapter_port,
             "game_server_host": self.game_server_host,
-            "game_server_port": self.game_server_port,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
+        if self.game_server_port is not None:
+            d["game_server_port"] = self.game_server_port
         if self.error is not None:
             d["error"] = self.error
         if self.stats is not None:
@@ -293,6 +297,25 @@ def _adapter_port(raw: Dict[str, Any], key: str, default: int) -> int:
         raise BackendError(
             code="INVALID_REQUEST",
             message=f"Field adapter_config.{key} must be in range 0-65535, got {value}",
+            details={"field": f"adapter_config.{key}", "value": value},
+        )
+    return value
+
+
+def _optional_adapter_port(raw: Dict[str, Any], key: str) -> Optional[int]:
+    if key not in raw or raw[key] is None:
+        return None
+    value = raw[key]
+    if type(value) is not int:
+        raise BackendError(
+            code="INVALID_REQUEST",
+            message=f"Field adapter_config.{key} must be an integer",
+            details={"field": f"adapter_config.{key}", "value": str(value)},
+        )
+    if value < 1 or value > 65535:
+        raise BackendError(
+            code="INVALID_REQUEST",
+            message=f"Field adapter_config.{key} must be in range 1-65535, got {value}",
             details={"field": f"adapter_config.{key}", "value": value},
         )
     return value

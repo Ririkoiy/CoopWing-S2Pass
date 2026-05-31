@@ -9,13 +9,16 @@ from __future__ import annotations
 import threading
 from typing import Callable, Dict, Optional
 
+from adapters.base import AdapterBase
 from adapters.local_udp_bridge_adapter import LocalUdpBridgeAdapter
 from adapters.profile import GameProfile
+from adapters.tcp_adapter import GenericTcpForwardAdapter
 from adapters.transport import Transport
 from backend.models import (
     ADAPTER_STATUS_ERROR,
     ADAPTER_STATUS_READY,
     ADAPTER_STATUS_STOPPED,
+    ADAPTER_TYPE_TCP_FORWARD,
     AdapterConfig,
     AdapterCounters,
     AdapterStatus,
@@ -30,7 +33,7 @@ class AdapterManager:
     def __init__(self, transport_factory: Optional[TransportFactory] = None) -> None:
         self._configs: Dict[str, AdapterConfig] = {}
         self._statuses: Dict[str, AdapterStatus] = {}
-        self._adapters: Dict[str, LocalUdpBridgeAdapter] = {}
+        self._adapters: Dict[str, AdapterBase] = {}
         self._transports: Dict[str, Transport] = {}
         self._transport_factory = transport_factory
         self._lock = threading.Lock()
@@ -83,7 +86,7 @@ class AdapterManager:
             self._close_transport(transport)
 
     def start(self, session_id: str) -> Optional[AdapterStatus]:
-        """Start the configured local UDP adapter if a transport is available."""
+        """Start the configured adapter (UDP bridge or TCP forward)."""
         with self._lock:
             config = self._configs.get(session_id)
             status = self._statuses.get(session_id)
@@ -93,6 +96,43 @@ class AdapterManager:
                 return status
             if session_id in self._adapters:
                 return self._snapshot_locked(session_id)
+            is_tcp = config.adapter_type == ADAPTER_TYPE_TCP_FORWARD
+
+        # --- TCP forward path (no transport needed) ---
+        if is_tcp:
+            profile = self._profile_from_config(session_id, config)
+            adapter = GenericTcpForwardAdapter(profile)
+
+            try:
+                adapter.start()
+            except Exception as exc:
+                adapter.stop()
+                return self._set_error(
+                    session_id,
+                    config,
+                    "ADAPTER_BIND_FAILED",
+                    str(exc),
+                )
+
+            local_host, local_port = adapter.get_local_addr()
+            ready = AdapterStatus(
+                enabled=True,
+                status=ADAPTER_STATUS_READY,
+                adapter_type=config.adapter_type,
+                bind_host=local_host or config.bind_host,
+                bind_port=local_port if local_port is not None else config.bind_port,
+                target_host=config.target_host,
+                target_port=config.target_port,
+                counters=AdapterCounters(),
+                error=None,
+            )
+            with self._lock:
+                self._adapters[session_id] = adapter
+                self._statuses[session_id] = ready
+                return self._snapshot_locked(session_id)
+
+        # --- UDP bridge path (needs transport) ---
+        with self._lock:
             transport = self._transports.get(session_id)
             transport_factory = None if transport is not None else self._transport_factory
 
@@ -119,10 +159,13 @@ class AdapterManager:
             self._close_transport(old_transport)
 
         profile = self._profile_from_config(session_id, config)
+        fixed_local_target_addr = None
+        if config.target_port is not None:
+            fixed_local_target_addr = (config.target_host, config.target_port)
         adapter = LocalUdpBridgeAdapter(
             profile=profile,
             transport=transport,
-            fixed_local_target_addr=(config.target_host, config.target_port),
+            fixed_local_target_addr=fixed_local_target_addr,
         )
 
         try:
@@ -194,17 +237,19 @@ class AdapterManager:
         if status is None:
             return None
         if adapter is not None and status.enabled:
-            with adapter._lock:
-                status.counters = AdapterCounters(
-                    packets_from_game=adapter.packets_from_game,
-                    packets_to_transport=adapter.packets_to_transport,
-                    packets_from_transport=adapter.packets_from_transport,
-                    packets_to_game=adapter.packets_to_game,
-                    bytes_from_game=adapter.bytes_from_game,
-                    bytes_to_transport=adapter.bytes_to_transport,
-                    bytes_from_transport=adapter.bytes_from_transport,
-                    bytes_to_game=adapter.bytes_to_game,
-                )
+            adapter_lock = getattr(adapter, "_lock", None)
+            if adapter_lock is not None:
+                with adapter_lock:
+                    status.counters = AdapterCounters(
+                        packets_from_game=getattr(adapter, "packets_from_game", 0),
+                        packets_to_transport=getattr(adapter, "packets_to_transport", 0),
+                        packets_from_transport=getattr(adapter, "packets_from_transport", 0),
+                        packets_to_game=getattr(adapter, "packets_to_game", 0),
+                        bytes_from_game=getattr(adapter, "bytes_from_game", 0),
+                        bytes_to_transport=getattr(adapter, "bytes_to_transport", 0),
+                        bytes_from_transport=getattr(adapter, "bytes_from_transport", 0),
+                        bytes_to_game=getattr(adapter, "bytes_to_game", 0),
+                    )
         return status
 
     def _set_error(
@@ -229,7 +274,6 @@ class AdapterManager:
             display_name=f"Adapter {session_id}",
             exe_path="",
             adapter_type=config.adapter_type,
-            protocol="udp",
             local_bind_host=config.bind_host,
             local_bind_port=config.bind_port,
             remote_target_host=config.target_host,

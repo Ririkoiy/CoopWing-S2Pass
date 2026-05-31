@@ -10,6 +10,7 @@ Manual real-core backend mode:
 from __future__ import annotations
 
 import json
+import os
 import sys
 import threading
 import time
@@ -136,6 +137,14 @@ class _BackendHandler(BaseHTTPRequestHandler):
     def _handle_create(self) -> None:
         body = self._read_body()
         if body is None:
+            return
+        if "game_server_port" not in body:
+            self._send_error(
+                400,
+                "INVALID_REQUEST",
+                "Missing or invalid field: game_server_port",
+                {"field": "game_server_port"},
+            )
             return
         try:
             info = self.manager.create_session(body)
@@ -276,6 +285,7 @@ def make_server(
 def main() -> None:
     host = "127.0.0.1"
     port = 21520
+    parent_pid: Optional[int] = None
 
     # minimal CLI arg parsing
     args = sys.argv[1:]
@@ -287,8 +297,14 @@ def main() -> None:
         elif args[i] == "--port" and i + 1 < len(args):
             port = int(args[i + 1])
             i += 2
+        elif args[i] == "--parent-pid" and i + 1 < len(args):
+            parent_pid = int(args[i + 1])
+            i += 2
         else:
-            print(f"Usage: python -m backend.server [--host 127.0.0.1] [--port 21520]")
+            print(
+                "Usage: python -m backend.server "
+                "[--host 127.0.0.1] [--port 21520] [--parent-pid PID]"
+            )
             sys.exit(1)
 
     if host not in ("127.0.0.1", "localhost"):
@@ -303,11 +319,48 @@ def main() -> None:
     manager = getattr(server, "_manager", None)
     runner_mode = getattr(manager, "runner_mode", "unknown")
     print(f"S2Pass Backend ({runner_mode} mode) listening on {host}:{port}")
+    if parent_pid is not None:
+        _start_parent_monitor(parent_pid, server)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         print("\nShutting down.")
         server.shutdown()
+
+
+def _start_parent_monitor(parent_pid: int, server: ThreadingHTTPServer) -> None:
+    """Stop the packaged backend when its owning UI process exits."""
+    if parent_pid <= 0 or parent_pid == os.getpid():
+        return
+
+    def monitor() -> None:
+        if sys.platform == "win32":
+            _wait_for_windows_process_exit(parent_pid)
+        else:
+            while True:
+                try:
+                    os.kill(parent_pid, 0)
+                except OSError:
+                    break
+                time.sleep(1.0)
+        server.shutdown()
+
+    threading.Thread(target=monitor, name="parent-pid-monitor", daemon=True).start()
+
+
+def _wait_for_windows_process_exit(parent_pid: int) -> None:
+    import ctypes
+
+    synchronize = 0x00100000
+    infinite = 0xFFFFFFFF
+    kernel32 = ctypes.windll.kernel32
+    handle = kernel32.OpenProcess(synchronize, False, parent_pid)
+    if not handle:
+        return
+    try:
+        kernel32.WaitForSingleObject(handle, infinite)
+    finally:
+        kernel32.CloseHandle(handle)
 
 
 if __name__ == "__main__":

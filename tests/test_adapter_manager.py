@@ -125,7 +125,7 @@ class AdapterManagerTests(unittest.TestCase):
             self.assertEqual(status.bind_host, "127.0.0.1")
             self.assertGreater(status.bind_port, 0)
             self.assertEqual(status.target_host, "127.0.0.1")
-            self.assertEqual(status.target_port, 40200)
+            self.assertIsNone(status.target_port)
             self.assertEqual(status.counters.to_dict(), {
                 "packets_from_game": 0,
                 "packets_to_transport": 0,

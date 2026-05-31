@@ -67,6 +67,17 @@ class HTTPTestBase(unittest.TestCase):
         return self._port
 
     def req(self, method, path, body=None):
+        if (
+            method == "POST"
+            and path == "/sessions/create"
+            and isinstance(body, dict)
+            and not body.pop("__omit_game_server_port", False)
+            and "game_server_port" not in body
+            and "server_host" in body
+            and "player_name" in body
+        ):
+            body = dict(body)
+            body["game_server_port"] = 27015
         return _request(method, path, body=body, port=self.port)
 
 
@@ -195,6 +206,16 @@ class TestCreateSessionEndpoint(HTTPTestBase):
         self.assertIn("error", data)
         self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
 
+    def test_create_missing_game_server_port_returns_400(self):
+        status, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "__omit_game_server_port": True,
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
+        self.assertEqual(data["error"]["details"]["field"], "game_server_port")
+
     def test_create_invalid_server_port_returns_400(self):
         status, data = self.req("POST", "/sessions/create", {
             "server_host": "192.168.1.10",
@@ -222,7 +243,7 @@ class TestCreateSessionEndpoint(HTTPTestBase):
                 "bind_host": "127.0.0.1",
                 "bind_port": 40100,
                 "target_host": "127.0.0.1",
-                "target_port": 40200,
+                "target_port": 27015,
             },
         })
         self.assertEqual(status, 201)
@@ -296,7 +317,7 @@ class TestJoinSessionEndpoint(HTTPTestBase):
             "player_name": "JoinerB",
         })
         self.assertEqual(data["game_server_host"], "127.0.0.1")
-        self.assertEqual(data["game_server_port"], 40100)
+        self.assertNotIn("game_server_port", data)
 
     def test_join_invalid_game_server_port_returns_400(self):
         status, data = self.req("POST", "/sessions/join", {
@@ -325,12 +346,12 @@ class TestJoinSessionEndpoint(HTTPTestBase):
             "adapter_config": {
                 "enabled": True,
                 "bind_port": 0,
-                "target_port": 40200,
             },
         })
         self.assertEqual(status, 201)
         self.assertEqual(data["status"], "running")
         self.assertEqual(data["adapter_status"]["status"], "stopped")
+        self.assertNotIn("target_port", data["adapter_status"])
         self.assertFalse(_json_contains_key(data, "relay_token"))
 
 
@@ -379,14 +400,14 @@ class TestStatusEndpoint(HTTPTestBase):
             "adapter_config": {
                 "enabled": True,
                 "bind_port": 40100,
-                "target_port": 40200,
+                "target_port": 27015,
             },
         })
         status, data = self.req("GET", f"/sessions/{created['session_id']}/status")
         self.assertEqual(status, 200)
         self.assertEqual(data["adapter_status"]["status"], "stopped")
         self.assertEqual(data["adapter_status"]["bind_port"], 40100)
-        self.assertEqual(data["adapter_status"]["target_port"], 40200)
+        self.assertEqual(data["adapter_status"]["target_port"], 27015)
 
     def test_status_does_not_expose_relay_token(self):
         _, created = self.req("POST", "/sessions/create", {
@@ -394,6 +415,7 @@ class TestStatusEndpoint(HTTPTestBase):
             "player_name": "Alice",
             "adapter_config": {
                 "enabled": True,
+                "target_port": 27015,
             },
         })
         _, data = self.req("GET", f"/sessions/{created['session_id']}/status")
@@ -532,6 +554,7 @@ class TestLogsEndpoint(HTTPTestBase):
             "player_name": "Alice",
             "adapter_config": {
                 "enabled": True,
+                "target_port": 27015,
             },
         })
         _, data = self.req("GET", f"/sessions/{created['session_id']}/logs")

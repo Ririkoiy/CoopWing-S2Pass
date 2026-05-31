@@ -163,8 +163,10 @@ class SessionManager:
         player_name = _require_str(request, "player_name")
         server_port = _require_port(request, "server_port", default=9000)
         server_udp_port = _require_port(request, "server_udp_port", default=9001)
+        game_server_port = _optional_request_port(request, "game_server_port")
         bind_port = _require_port_or_zero(request, "bind_port", default=0)
         adapter_config = _parse_adapter_config(request)
+        _validate_create_adapter_target(adapter_config, game_server_port)
 
         session_id = _generate_session_id()
         now = time.time()
@@ -182,6 +184,8 @@ class SessionManager:
             server_udp_port=server_udp_port,
             adapter_host=str(request.get("bind_host", "127.0.0.1")),
             adapter_port=adapter_port,
+            game_server_host=str(request.get("game_server_host", "127.0.0.1")),
+            game_server_port=game_server_port,
             created_at=now,
             updated_at=now,
             stats=SessionStats(),
@@ -222,7 +226,7 @@ class SessionManager:
         player_name = _require_str(request, "player_name")
         server_port = _require_port(request, "server_port", default=9000)
         server_udp_port = _require_port(request, "server_udp_port", default=9001)
-        game_server_port = _require_port(request, "game_server_port", default=40100)
+        game_server_port = _optional_request_port(request, "game_server_port")
         adapter_config = _parse_adapter_config(request)
 
         session_id = _generate_session_id()
@@ -467,6 +471,9 @@ class SessionManager:
             if info is None:
                 return
             info.adapter_status = status
+            if status.enabled and status.bind_host and status.bind_port:
+                info.adapter_host = status.bind_host
+                info.adapter_port = status.bind_port
             info.updated_at = time.time()
 
         if status.status == ADAPTER_STATUS_READY:
@@ -520,6 +527,22 @@ def _require_port(request: Dict[str, Any], key: str, default: int) -> int:
     return port
 
 
+def _require_present_port(request: Dict[str, Any], key: str) -> int:
+    if key not in request:
+        raise BackendError(
+            code="INVALID_REQUEST",
+            message=f"Missing or invalid field: {key}",
+            details={"field": key},
+        )
+    return _require_port(request, key, default=0)
+
+
+def _optional_request_port(request: Dict[str, Any], key: str) -> Optional[int]:
+    if key not in request or request[key] is None:
+        return None
+    return _require_port(request, key, default=0)
+
+
 def _require_port_or_zero(request: Dict[str, Any], key: str, default: int) -> int:
     """Validate *key* is 0 or a valid port in 1-65535. 0 means 'auto-assign'."""
     raw = request.get(key, default)
@@ -544,6 +567,26 @@ def _parse_adapter_config(request: Dict[str, Any]) -> Optional[AdapterConfig]:
     if "adapter_config" not in request:
         return None
     return AdapterConfig.from_dict(request["adapter_config"])
+
+
+def _validate_create_adapter_target(
+    adapter_config: Optional[AdapterConfig],
+    game_server_port: Optional[int],
+) -> None:
+    if adapter_config is None or not adapter_config.enabled:
+        return
+    if game_server_port is None:
+        return
+    if adapter_config.target_port != game_server_port:
+        raise BackendError(
+            code="INVALID_REQUEST",
+            message="Create adapter_config.target_port must match game_server_port",
+            details={
+                "field": "adapter_config.target_port",
+                "game_server_port": game_server_port,
+                "target_port": adapter_config.target_port,
+            },
+        )
 
 
 def _adapter_status_event_data(status: Optional[AdapterStatus]) -> Dict[str, Any]:

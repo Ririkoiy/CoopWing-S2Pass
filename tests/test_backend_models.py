@@ -73,7 +73,7 @@ class AdapterConfigTests(unittest.TestCase):
         self.assertEqual(cfg.bind_host, "127.0.0.1")
         self.assertEqual(cfg.bind_port, 0)
         self.assertEqual(cfg.target_host, "127.0.0.1")
-        self.assertEqual(cfg.target_port, 40200)
+        self.assertIsNone(cfg.target_port)
 
     def test_from_dict_valid(self):
         cfg = AdapterConfig.from_dict({
@@ -234,7 +234,7 @@ class SessionInfoTests(unittest.TestCase):
         self.assertEqual(d["adapter_host"], "127.0.0.1")
         self.assertEqual(d["adapter_port"], 40000)
         self.assertEqual(d["game_server_host"], "127.0.0.1")
-        self.assertEqual(d["game_server_port"], 0)
+        self.assertNotIn("game_server_port", d)
         self.assertEqual(d["created_at"], 1000.0)
         self.assertEqual(d["updated_at"], 1000.0)
 

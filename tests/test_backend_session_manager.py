@@ -770,13 +770,14 @@ class TestSessionManager(unittest.TestCase):
         })
         self.assertEqual(info.game_server_host, "127.0.0.1")
 
-    def test_join_session_default_game_server_port(self):
+    def test_join_session_omits_default_game_server_port(self):
         info = self.mgr.join_session({
             "server_host": "192.168.1.10",
             "room_id": "ABC234",
             "player_name": "JoinerB",
         })
-        self.assertEqual(info.game_server_port, 40100)
+        self.assertIsNone(info.game_server_port)
+        self.assertNotIn("game_server_port", info.to_dict())
 
     def test_join_session_custom_game_server(self):
         info = self.mgr.join_session({
@@ -837,13 +838,13 @@ class TestSessionManager(unittest.TestCase):
             "adapter_config": {
                 "enabled": True,
                 "bind_port": 40101,
-                "target_port": 40200,
             },
         })
         d = info.to_dict()["adapter_status"]
         self.assertTrue(d["enabled"])
         self.assertEqual(d["status"], "stopped")
         self.assertEqual(d["bind_port"], 40101)
+        self.assertNotIn("target_port", d)
 
     def test_join_session_invalid_game_server_port_negative(self):
         with self.assertRaises(BackendError) as ctx:

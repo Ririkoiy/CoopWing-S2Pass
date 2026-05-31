@@ -1,0 +1,82 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+.env
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+
+# Runtime / local config
+diagnostics/
+logs/
+config/profiles.json
+config/settings.json
+config/servers.json
+
+# Build / release artifacts
+build/
+dist/
+release/
+*.zip
+*.exe
+
+# Flutter / Dart
+**/.dart_tool/
+**/.flutter-plugins
+**/.flutter-plugins-dependencies
+**/windows/flutter/ephemeral/
+**/ios/Flutter/ephemeral/
+**/linux/flutter/ephemeral/
+**/macos/Flutter/ephemeral/
+s2pass_flutter_mock/build/
+
+# Antigravity / AI agent artifacts
+task.md
+walkthrough.md
+implementation_plan.md
+
+# Internal development notes
+AI_CONTEXT.txt
+PROJECT_STATUS.md
+PROTOCOL_LOCK.md
+QUICKSTART.md
+README.zh-CN.md
+RELEASE_NOTES_v0.1.md
+GAME_ADAPTER_MODEL.md
+GAME_TEST_PLAN_PREVIEW_0.1.md
+KNOWN_LIMITATIONS.md
+PACKAGING_PLAN.md
+FLUTTER_PRODUCT_UI_AND_BACKEND_BRIDGE*.md
+modification_log.md
+
+# Internal protocol docs
+protocol.md
+protocol_lock.md
+protocol_lock.txt
+
+# Internal docs and reports
+docs/
+reports/
+packaging/
+
+# Local run scripts
+run_gui.bat
+run_gui.ps1
+
+# Old/internal GUI entry points
+gui_client.py
+gui_adapter_controller.py
+
+# Packaging specs
+coopwing_backend.spec
+
+# Local media / temp
+Ciallo.mp4

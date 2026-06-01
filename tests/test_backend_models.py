@@ -235,6 +235,7 @@ class SessionInfoTests(unittest.TestCase):
         self.assertEqual(d["adapter_port"], 40000)
         self.assertEqual(d["game_server_host"], "127.0.0.1")
         self.assertNotIn("game_server_port", d)
+        self.assertTrue(d["force_relay"])
         self.assertEqual(d["created_at"], 1000.0)
         self.assertEqual(d["updated_at"], 1000.0)
 

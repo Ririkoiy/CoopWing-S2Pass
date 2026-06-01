@@ -229,6 +229,7 @@ class SessionInfo:
     adapter_port: int = 0
     game_server_host: str = "127.0.0.1"
     game_server_port: Optional[int] = None
+    force_relay: bool = True
     created_at: float = 0.0
     updated_at: float = 0.0
     error: Optional[Dict[str, Any]] = None
@@ -249,6 +250,7 @@ class SessionInfo:
             "adapter_host": self.adapter_host,
             "adapter_port": self.adapter_port,
             "game_server_host": self.game_server_host,
+            "force_relay": self.force_relay,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }

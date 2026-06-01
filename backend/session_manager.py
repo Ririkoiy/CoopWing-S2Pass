@@ -164,6 +164,7 @@ class SessionManager:
         server_port = _require_port(request, "server_port", default=9000)
         server_udp_port = _require_port(request, "server_udp_port", default=9001)
         game_server_port = _optional_request_port(request, "game_server_port")
+        force_relay = _request_bool(request, "force_relay", default=True)
         bind_port = _require_port_or_zero(request, "bind_port", default=0)
         adapter_config = _parse_adapter_config(request)
         _validate_create_adapter_target(adapter_config, game_server_port)
@@ -186,6 +187,7 @@ class SessionManager:
             adapter_port=adapter_port,
             game_server_host=str(request.get("game_server_host", "127.0.0.1")),
             game_server_port=game_server_port,
+            force_relay=force_relay,
             created_at=now,
             updated_at=now,
             stats=SessionStats(),
@@ -227,6 +229,7 @@ class SessionManager:
         server_port = _require_port(request, "server_port", default=9000)
         server_udp_port = _require_port(request, "server_udp_port", default=9001)
         game_server_port = _optional_request_port(request, "game_server_port")
+        force_relay = _request_bool(request, "force_relay", default=True)
         adapter_config = _parse_adapter_config(request)
 
         session_id = _generate_session_id()
@@ -245,6 +248,7 @@ class SessionManager:
             adapter_port=self._allocate_fake_port(),
             game_server_host=str(request.get("game_server_host", "127.0.0.1")),
             game_server_port=game_server_port,
+            force_relay=force_relay,
             created_at=now,
             updated_at=now,
             stats=SessionStats(),
@@ -541,6 +545,17 @@ def _optional_request_port(request: Dict[str, Any], key: str) -> Optional[int]:
     if key not in request or request[key] is None:
         return None
     return _require_port(request, key, default=0)
+
+
+def _request_bool(request: Dict[str, Any], key: str, default: bool) -> bool:
+    value = request.get(key, default)
+    if not isinstance(value, bool):
+        raise BackendError(
+            code="INVALID_REQUEST",
+            message=f"Field {key} must be a boolean",
+            details={"field": key, "value": str(value)},
+        )
+    return value
 
 
 def _require_port_or_zero(request: Dict[str, Any], key: str, default: int) -> int:

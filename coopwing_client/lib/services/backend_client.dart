@@ -17,6 +17,7 @@ abstract class BackendClient {
     required int gameServerPort,
     required String bindHost,
     required int bindPort,
+    bool forceRelay = true,
     AdapterConfig? adapterConfig,
   });
 
@@ -28,6 +29,7 @@ abstract class BackendClient {
     required String playerName,
     required String gameServerHost,
     int? gameServerPort,
+    bool forceRelay = true,
     AdapterConfig? adapterConfig,
   });
 

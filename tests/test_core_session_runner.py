@@ -94,7 +94,7 @@ class EventCollector:
             return [data for etype, _message, data in self.events if etype == event_type]
 
 
-def _make_info(role="create"):
+def _make_info(role="create", force_relay=True):
     return SessionInfo(
         session_id="s_abc123def456",
         role=role,
@@ -104,6 +104,7 @@ def _make_info(role="create"):
         server_host="127.0.0.1",
         server_port=9000,
         server_udp_port=9001,
+        force_relay=force_relay,
         created_at=time.time(),
         updated_at=time.time(),
         stats=SessionStats(),
@@ -143,6 +144,18 @@ class CoreSessionRunnerTests(unittest.TestCase):
         self.assertTrue(config.is_payload_mode)
         self.assertFalse(config.send_test)
         self.assertNotIn("room_id", config.kwargs)
+        runner.stop(info, collector.emit)
+
+    def test_start_create_passes_force_relay_false(self):
+        fake_core = make_fake_core_class()
+        runner = CoreSessionRunner(core_class=fake_core, config_class=FakeConfig)
+        collector = EventCollector()
+        info = _make_info("create", force_relay=False)
+
+        runner.start_create(info, collector.emit)
+        self.assertTrue(fake_core.instance_created.wait(timeout=1.0))
+
+        self.assertFalse(FakeConfig.instances[0].force_relay)
         runner.stop(info, collector.emit)
 
     def test_transport_factory_called_once_with_core_and_owning_loop(self):
@@ -345,8 +358,8 @@ class CoreSessionRunnerTests(unittest.TestCase):
 
         self.assertTrue(collector.wait_for("relay_ready"))
         self.assertTrue(collector.wait_for("session_running"))
-        self.assertIn("relay_ready", collector.types())
-        self.assertIn("session_running", collector.types())
+        types = collector.types()
+        self.assertLess(types.index("relay_ready"), types.index("session_running"))
         self.assertTrue(runner.wait(timeout=1.0))
 
     def test_error_maps_to_session_failed(self):

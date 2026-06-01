@@ -269,7 +269,7 @@ class CoreSessionRunner:
             "udp_port": info.server_udp_port,
             "player_name": info.player_name,
             "role": role,
-            "force_relay": True,
+            "force_relay": info.force_relay,
             "is_payload_mode": True,
             "send_test": False,
         }

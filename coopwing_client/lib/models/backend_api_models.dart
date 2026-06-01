@@ -318,6 +318,7 @@ class SessionInfo {
     required this.adapterPort,
     required this.gameServerHost,
     this.gameServerPort,
+    required this.forceRelay,
     required this.createdAt,
     required this.updatedAt,
     required this.stats,
@@ -337,6 +338,7 @@ class SessionInfo {
   final int adapterPort;
   final String gameServerHost;
   final int? gameServerPort;
+  final bool forceRelay;
   final num createdAt;
   final num updatedAt;
   final SessionStats stats;
@@ -360,6 +362,7 @@ class SessionInfo {
       adapterPort: json['adapter_port'] as int? ?? 0,
       gameServerHost: json['game_server_host'] as String? ?? '127.0.0.1',
       gameServerPort: _nullableAsInt(json['game_server_port']),
+      forceRelay: json['force_relay'] as bool? ?? true,
       createdAt: json['created_at'] as num? ?? 0,
       updatedAt: json['updated_at'] as num? ?? 0,
       stats: statsJson == null
@@ -386,6 +389,7 @@ class SessionInfo {
       'adapter_port': adapterPort,
       'game_server_host': gameServerHost,
       if (gameServerPort != null) 'game_server_port': gameServerPort,
+      'force_relay': forceRelay,
       'created_at': createdAt,
       'updated_at': updatedAt,
       'stats': stats.toJson(),

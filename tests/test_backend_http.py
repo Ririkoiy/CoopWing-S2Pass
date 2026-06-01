@@ -191,6 +191,21 @@ class TestCreateSessionEndpoint(HTTPTestBase):
         })
         self.assertEqual(data["status"], "running")
 
+    def test_create_defaults_force_relay_true(self):
+        _, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+        })
+        self.assertTrue(data["force_relay"])
+
+    def test_create_accepts_force_relay_false(self):
+        _, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "force_relay": False,
+        })
+        self.assertFalse(data["force_relay"])
+
     def test_create_session_id_format(self):
         _, data = self.req("POST", "/sessions/create", {
             "server_host": "192.168.1.10",
@@ -318,6 +333,23 @@ class TestJoinSessionEndpoint(HTTPTestBase):
         })
         self.assertEqual(data["game_server_host"], "127.0.0.1")
         self.assertNotIn("game_server_port", data)
+
+    def test_join_defaults_force_relay_true(self):
+        _, data = self.req("POST", "/sessions/join", {
+            "server_host": "192.168.1.10",
+            "room_id": "ABC234",
+            "player_name": "JoinerB",
+        })
+        self.assertTrue(data["force_relay"])
+
+    def test_join_accepts_force_relay_false(self):
+        _, data = self.req("POST", "/sessions/join", {
+            "server_host": "192.168.1.10",
+            "room_id": "ABC234",
+            "player_name": "JoinerB",
+            "force_relay": False,
+        })
+        self.assertFalse(data["force_relay"])
 
     def test_join_invalid_game_server_port_returns_400(self):
         status, data = self.req("POST", "/sessions/join", {

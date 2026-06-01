@@ -145,6 +145,7 @@ class MockBackendClient implements BackendClient {
     required int gameServerPort,
     required String bindHost,
     required int bindPort,
+    bool forceRelay = true,
     AdapterConfig? adapterConfig,
   }) async {
     await _mockDelay();
@@ -160,6 +161,7 @@ class MockBackendClient implements BackendClient {
       adapterPort: bindPort,
       gameServerHost: '127.0.0.1',
       gameServerPort: gameServerPort,
+      forceRelay: forceRelay,
       adapterStatus: _mockAdapterStatus(adapterConfig),
     );
     _sessions.insert(0, session);
@@ -173,6 +175,12 @@ class MockBackendClient implements BackendClient {
       SessionEvent(
         type: 'room_created',
         message: 'Room ${session.roomId} created.',
+        timestamp: session.updatedAt,
+        data: {'room_id': session.roomId},
+      ),
+      SessionEvent(
+        type: 'relay_ready',
+        message: 'Mock relay path ready.',
         timestamp: session.updatedAt,
         data: {'room_id': session.roomId},
       ),
@@ -196,6 +204,7 @@ class MockBackendClient implements BackendClient {
     required String playerName,
     required String gameServerHost,
     int? gameServerPort,
+    bool forceRelay = true,
     AdapterConfig? adapterConfig,
   }) async {
     await _mockDelay();
@@ -211,6 +220,7 @@ class MockBackendClient implements BackendClient {
       adapterPort: 0,
       gameServerHost: gameServerHost,
       gameServerPort: gameServerPort,
+      forceRelay: forceRelay,
       adapterStatus: _mockAdapterStatus(adapterConfig),
     );
     _sessions.insert(0, session);
@@ -224,6 +234,12 @@ class MockBackendClient implements BackendClient {
       SessionEvent(
         type: 'room_joined',
         message: 'Joined room ${session.roomId}.',
+        timestamp: session.updatedAt,
+        data: {'room_id': session.roomId},
+      ),
+      SessionEvent(
+        type: 'relay_ready',
+        message: 'Mock relay path ready.',
         timestamp: session.updatedAt,
         data: {'room_id': session.roomId},
       ),
@@ -281,6 +297,7 @@ class MockBackendClient implements BackendClient {
       adapterPort: current.adapterPort,
       gameServerHost: current.gameServerHost,
       gameServerPort: current.gameServerPort,
+      forceRelay: current.forceRelay,
       createdAt: current.createdAt,
       updatedAt: DateTime.now().millisecondsSinceEpoch / 1000,
       stats: current.stats,
@@ -669,6 +686,7 @@ class MockBackendClient implements BackendClient {
     required int adapterPort,
     required String gameServerHost,
     int? gameServerPort,
+    bool forceRelay = true,
     AdapterStatus? adapterStatus,
   }) {
     final now = DateTime.now().millisecondsSinceEpoch / 1000;
@@ -685,6 +703,7 @@ class MockBackendClient implements BackendClient {
       adapterPort: adapterPort,
       gameServerHost: gameServerHost,
       gameServerPort: gameServerPort,
+      forceRelay: forceRelay,
       createdAt: now,
       updatedAt: now,
       stats: SessionStats.empty(),

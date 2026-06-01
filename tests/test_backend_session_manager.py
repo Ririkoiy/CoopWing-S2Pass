@@ -165,6 +165,45 @@ class DelayedConfirmedCreateRunner:
         emit("session_stopped", "Session stopped", {"session_id": info.session_id})
 
 
+class ManualRelayReadyRunner:
+    def __init__(self):
+        self.calls = []
+        self.release_relay = threading.Event()
+        self.relay_done = threading.Event()
+
+    def _finish_after_relay(self, info, emit, room_id):
+        if not self.release_relay.wait(timeout=1.0):
+            return
+        emit("relay_ready", "Relay path ready", {"room_id": room_id})
+        emit("session_running", "Session running", {"session_id": info.session_id})
+        self.relay_done.set()
+
+    def start_create(self, info, emit):
+        self.calls.append(("start_create", info.session_id, info.force_relay))
+        if info.room_id is None:
+            info.room_id = "ABC234"
+        emit("room_created", f"Room {info.room_id} created", {"room_id": info.room_id})
+        threading.Thread(
+            target=self._finish_after_relay,
+            args=(info, emit, info.room_id),
+            daemon=True,
+        ).start()
+
+    def start_join(self, info, emit):
+        self.calls.append(("start_join", info.session_id, info.force_relay))
+        emit("room_joined", f"Joined room {info.room_id}", {"room_id": info.room_id})
+        threading.Thread(
+            target=self._finish_after_relay,
+            args=(info, emit, info.room_id),
+            daemon=True,
+        ).start()
+
+    def stop(self, info, emit):
+        self.calls.append(("stop", info.session_id))
+        emit("session_stopping", "Session stopping", {"session_id": info.session_id})
+        emit("session_stopped", "Session stopped", {"session_id": info.session_id})
+
+
 class RoomNotFoundJoinRunner(RecordingRunner):
     def start_join(self, info, emit):
         self.calls.append(("start_join", info.session_id))
@@ -423,6 +462,68 @@ class TestSessionManager(unittest.TestCase):
             "player_name": "CreatorA",
         })
         self.assertEqual(info.status, "running")
+
+    def test_create_session_defaults_force_relay_true(self):
+        info = self.mgr.create_session({
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+        })
+
+        self.assertTrue(info.force_relay)
+        self.assertTrue(info.to_dict()["force_relay"])
+
+    def test_create_session_accepts_force_relay_false(self):
+        info = self.mgr.create_session({
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "force_relay": False,
+        })
+
+        self.assertFalse(info.force_relay)
+        self.assertFalse(info.to_dict()["force_relay"])
+
+    def test_create_session_rejects_non_bool_force_relay(self):
+        with self.assertRaises(BackendError) as ctx:
+            self.mgr.create_session({
+                "server_host": "192.168.1.10",
+                "player_name": "CreatorA",
+                "force_relay": "true",
+            })
+
+        self.assertEqual(ctx.exception.code, "INVALID_REQUEST")
+        self.assertEqual(ctx.exception.details["field"], "force_relay")
+
+    def test_create_force_relay_true_waits_running_until_relay_ready(self):
+        runners = []
+
+        def factory():
+            runner = ManualRelayReadyRunner()
+            runners.append(runner)
+            return runner
+
+        mgr = SessionManager(runner_factory=factory, create_confirm_timeout=1.0)
+
+        info = mgr.create_session({
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "force_relay": True,
+        })
+
+        self.assertEqual(info.status, "room_created")
+        self.assertEqual(runners[0].calls[0], ("start_create", info.session_id, True))
+        self.assertNotIn(
+            "session_running",
+            [event.type for event in mgr.get_logs(info.session_id)],
+        )
+
+        runners[0].release_relay.set()
+        self.assertTrue(runners[0].relay_done.wait(timeout=1.0))
+        logs = mgr.get_logs(info.session_id)
+        types = [event.type for event in logs]
+
+        self.assertEqual(mgr.get_session(info.session_id).status, "running")
+        self.assertLess(types.index("room_created"), types.index("relay_ready"))
+        self.assertLess(types.index("relay_ready"), types.index("session_running"))
 
     def test_create_session_waits_for_confirmed_room_id(self):
         runners = []
@@ -797,6 +898,72 @@ class TestSessionManager(unittest.TestCase):
             "player_name": "JoinerB",
         })
         self.assertEqual(info.status, "running")
+
+    def test_join_session_defaults_force_relay_true(self):
+        info = self.mgr.join_session({
+            "server_host": "192.168.1.10",
+            "room_id": "ABC234",
+            "player_name": "JoinerB",
+        })
+
+        self.assertTrue(info.force_relay)
+        self.assertTrue(info.to_dict()["force_relay"])
+
+    def test_join_session_accepts_force_relay_false(self):
+        info = self.mgr.join_session({
+            "server_host": "192.168.1.10",
+            "room_id": "ABC234",
+            "player_name": "JoinerB",
+            "force_relay": False,
+        })
+
+        self.assertFalse(info.force_relay)
+        self.assertFalse(info.to_dict()["force_relay"])
+
+    def test_join_session_rejects_non_bool_force_relay(self):
+        with self.assertRaises(BackendError) as ctx:
+            self.mgr.join_session({
+                "server_host": "192.168.1.10",
+                "room_id": "ABC234",
+                "player_name": "JoinerB",
+                "force_relay": "true",
+            })
+
+        self.assertEqual(ctx.exception.code, "INVALID_REQUEST")
+        self.assertEqual(ctx.exception.details["field"], "force_relay")
+
+    def test_join_force_relay_true_waits_running_until_relay_ready(self):
+        runners = []
+
+        def factory():
+            runner = ManualRelayReadyRunner()
+            runners.append(runner)
+            return runner
+
+        mgr = SessionManager(runner_factory=factory)
+
+        info = mgr.join_session({
+            "server_host": "192.168.1.10",
+            "room_id": "ABC234",
+            "player_name": "JoinerB",
+            "force_relay": True,
+        })
+
+        self.assertEqual(info.status, "room_joined")
+        self.assertEqual(runners[0].calls[0], ("start_join", info.session_id, True))
+        self.assertNotIn(
+            "session_running",
+            [event.type for event in mgr.get_logs(info.session_id)],
+        )
+
+        runners[0].release_relay.set()
+        self.assertTrue(runners[0].relay_done.wait(timeout=1.0))
+        logs = mgr.get_logs(info.session_id)
+        types = [event.type for event in logs]
+
+        self.assertEqual(mgr.get_session(info.session_id).status, "running")
+        self.assertLess(types.index("room_joined"), types.index("relay_ready"))
+        self.assertLess(types.index("relay_ready"), types.index("session_running"))
 
     def test_join_session_has_stats(self):
         info = self.mgr.join_session({

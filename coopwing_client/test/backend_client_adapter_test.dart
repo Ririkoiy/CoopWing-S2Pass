@@ -123,6 +123,7 @@ void main() {
 
       expect(capture.path, '/sessions/create');
       expect(capture.body['game_server_port'], 27015);
+      expect(capture.body['force_relay'], isTrue);
       expect(capture.body.containsKey('adapter_config'), isFalse);
     });
 
@@ -149,6 +150,7 @@ void main() {
 
         expect(capture.path, '/sessions/join');
         expect(capture.body.containsKey('game_server_port'), isFalse);
+        expect(capture.body['force_relay'], isTrue);
         expect(capture.body['adapter_config'], {
           'enabled': true,
           'adapter_type': 'local_udp_bridge',
@@ -158,6 +160,41 @@ void main() {
         });
       },
     );
+
+    test('Create request can opt out of force relay', () async {
+      final capture = await _withCaptureServer((client) {
+        return client.createSession(
+          serverHost: '127.0.0.1',
+          serverPort: 9000,
+          serverUdpPort: 9001,
+          playerName: 'Alice',
+          gameServerPort: 27015,
+          bindHost: '127.0.0.1',
+          bindPort: 0,
+          forceRelay: false,
+        );
+      });
+
+      expect(capture.path, '/sessions/create');
+      expect(capture.body['force_relay'], isFalse);
+    });
+
+    test('Join request can opt out of force relay', () async {
+      final capture = await _withCaptureServer((client) {
+        return client.joinSession(
+          serverHost: '127.0.0.1',
+          serverPort: 9000,
+          serverUdpPort: 9001,
+          roomId: 'ABC234',
+          playerName: 'Bob',
+          gameServerHost: '127.0.0.1',
+          forceRelay: false,
+        );
+      });
+
+      expect(capture.path, '/sessions/join');
+      expect(capture.body['force_relay'], isFalse);
+    });
   });
 
   test('HTTP 400 validation errors preserve backend error code', () async {
@@ -217,6 +254,7 @@ Map<String, Object?> _sessionJson({Map<String, Object?>? adapterStatus}) {
     'adapter_port': 0,
     'game_server_host': '127.0.0.1',
     'game_server_port': 40100,
+    'force_relay': true,
     'created_at': 1,
     'updated_at': 2,
     'stats': {},

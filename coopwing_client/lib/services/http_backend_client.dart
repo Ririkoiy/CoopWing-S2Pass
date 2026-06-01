@@ -38,6 +38,7 @@ class HttpBackendClient implements BackendClient {
     required int gameServerPort,
     required String bindHost,
     required int bindPort,
+    bool forceRelay = true,
     AdapterConfig? adapterConfig,
   }) async {
     final json = await _request(
@@ -51,6 +52,7 @@ class HttpBackendClient implements BackendClient {
         'game_server_port': gameServerPort,
         'bind_host': bindHost,
         'bind_port': bindPort,
+        'force_relay': forceRelay,
         if (adapterConfig != null) 'adapter_config': adapterConfig.toJson(),
       },
     );
@@ -66,6 +68,7 @@ class HttpBackendClient implements BackendClient {
     required String playerName,
     required String gameServerHost,
     int? gameServerPort,
+    bool forceRelay = true,
     AdapterConfig? adapterConfig,
   }) async {
     final json = await _request(
@@ -78,6 +81,7 @@ class HttpBackendClient implements BackendClient {
         'room_id': roomId,
         'player_name': playerName,
         'game_server_host': gameServerHost,
+        'force_relay': forceRelay,
         if (gameServerPort != null) 'game_server_port': gameServerPort,
         if (adapterConfig != null) 'adapter_config': adapterConfig.toJson(),
       },

@@ -80,6 +80,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       AdapterTrafficRateCalculator();
   _SessionMode _mode = _SessionMode.create;
   _AdapterMode _adapterMode = _AdapterMode.udpExperimental;
+  bool _forceRelay = true;
   bool _busy = false;
   bool _pollingSession = false;
   Timer? _sessionPollTimer;
@@ -237,6 +238,11 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
                 playerNameController: _playerNameController,
                 gameServerPortController: _gameServerPortController,
                 roomController: _roomController,
+                forceRelay: _forceRelay,
+                forceRelayEnabled: !_busy,
+                onForceRelayChanged: (value) {
+                  setState(() => _forceRelay = value);
+                },
                 canCreate: _canCreate,
                 canJoin: _canJoin,
                 onCreate: _createSession,
@@ -389,6 +395,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
           gameServerPort: gameServerPort,
           bindHost: '127.0.0.1',
           bindPort: 0,
+          forceRelay: _forceRelay,
           adapterConfig: _adapterConfigOrNull(includeTargetPort: true),
         );
         _applySessionSnapshot(
@@ -415,6 +422,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
           roomId: roomId,
           playerName: playerName,
           gameServerHost: gameServerHost,
+          forceRelay: _forceRelay,
           adapterConfig: _adapterConfigOrNull(includeTargetPort: false),
         );
         _applySessionSnapshot(
@@ -734,6 +742,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       adapterPort: session.adapterPort,
       gameServerHost: session.gameServerHost,
       gameServerPort: session.gameServerPort,
+      forceRelay: session.forceRelay,
       createdAt: session.createdAt,
       updatedAt: session.updatedAt,
       stats: session.stats,
@@ -945,6 +954,9 @@ class _ModeForm extends StatelessWidget {
     required this.playerNameController,
     required this.gameServerPortController,
     required this.roomController,
+    required this.forceRelay,
+    required this.forceRelayEnabled,
+    required this.onForceRelayChanged,
     required this.canCreate,
     required this.canJoin,
     required this.onCreate,
@@ -955,6 +967,9 @@ class _ModeForm extends StatelessWidget {
   final TextEditingController playerNameController;
   final TextEditingController gameServerPortController;
   final TextEditingController roomController;
+  final bool forceRelay;
+  final bool forceRelayEnabled;
+  final ValueChanged<bool> onForceRelayChanged;
   final bool canCreate;
   final bool canJoin;
   final VoidCallback onCreate;
@@ -1033,6 +1048,17 @@ class _ModeForm extends StatelessWidget {
               ),
             ),
           ],
+          const SizedBox(height: 12),
+          CheckboxListTile(
+            value: forceRelay,
+            onChanged: forceRelayEnabled
+                ? (value) => onForceRelayChanged(value ?? true)
+                : null,
+            contentPadding: EdgeInsets.zero,
+            dense: true,
+            controlAffinity: ListTileControlAffinity.leading,
+            title: Text(loc.get('force_relay')),
+          ),
           const SizedBox(height: 12),
           Align(
             alignment: Alignment.centerLeft,

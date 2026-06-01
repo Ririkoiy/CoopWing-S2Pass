@@ -456,6 +456,7 @@ void main() {
       BackendBridgePanel.defaultRelayUdpPort,
     );
     expect(client.lastCreateGameServerPort, 27015);
+    expect(client.lastCreateForceRelay, isTrue);
     final config = client.lastCreateAdapterConfig!;
     expect(config.enabled, isTrue);
     expect(config.adapterType, 'local_udp_bridge');
@@ -463,6 +464,37 @@ void main() {
     expect(config.bindPort, 0);
     expect(config.targetHost, '127.0.0.1');
     expect(config.targetPort, 27015);
+  });
+
+  testWidgets('Force Relay is visible and enabled by default', (tester) async {
+    final client = _CapturingMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Force Relay'), findsOneWidget);
+    final checkbox = tester.widget<Checkbox>(find.byType(Checkbox));
+    expect(checkbox.value, isTrue);
+  });
+
+  testWidgets('Create request passes disabled Force Relay when unchecked', (
+    tester,
+  ) async {
+    final client = _CapturingMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.byType(Checkbox));
+    await tester.pumpAndSettle();
+    await _enterPlayerName(tester);
+    await _enterGameServerPort(tester, '27015');
+    await tester.tap(find.widgetWithText(FilledButton, 'Create Room'));
+    await tester.pumpAndSettle();
+
+    expect(client.lastCreateForceRelay, isFalse);
   });
 
   testWidgets('Join request uses relay and UDP adapter defaults', (
@@ -488,6 +520,7 @@ void main() {
       client.lastJoinServerUdpPort,
       BackendBridgePanel.defaultRelayUdpPort,
     );
+    expect(client.lastJoinForceRelay, isTrue);
     final config = client.lastJoinAdapterConfig!;
     expect(config.enabled, isTrue);
     expect(config.adapterType, 'local_udp_bridge');
@@ -805,10 +838,12 @@ class _CapturingMockClient extends MockBackendClient {
   int? lastCreateServerPort;
   int? lastCreateServerUdpPort;
   int? lastCreateGameServerPort;
+  bool? lastCreateForceRelay;
   AdapterConfig? lastCreateAdapterConfig;
   String? lastJoinServerHost;
   int? lastJoinServerPort;
   int? lastJoinServerUdpPort;
+  bool? lastJoinForceRelay;
   AdapterConfig? lastJoinAdapterConfig;
 
   @override
@@ -820,12 +855,14 @@ class _CapturingMockClient extends MockBackendClient {
     required int gameServerPort,
     required String bindHost,
     required int bindPort,
+    bool forceRelay = true,
     AdapterConfig? adapterConfig,
   }) {
     lastCreateServerHost = serverHost;
     lastCreateServerPort = serverPort;
     lastCreateServerUdpPort = serverUdpPort;
     lastCreateGameServerPort = gameServerPort;
+    lastCreateForceRelay = forceRelay;
     lastCreateAdapterConfig = adapterConfig;
     return super.createSession(
       serverHost: serverHost,
@@ -835,6 +872,7 @@ class _CapturingMockClient extends MockBackendClient {
       gameServerPort: gameServerPort,
       bindHost: bindHost,
       bindPort: bindPort,
+      forceRelay: forceRelay,
       adapterConfig: adapterConfig,
     );
   }
@@ -848,11 +886,13 @@ class _CapturingMockClient extends MockBackendClient {
     required String playerName,
     required String gameServerHost,
     int? gameServerPort,
+    bool forceRelay = true,
     AdapterConfig? adapterConfig,
   }) {
     lastJoinServerHost = serverHost;
     lastJoinServerPort = serverPort;
     lastJoinServerUdpPort = serverUdpPort;
+    lastJoinForceRelay = forceRelay;
     lastJoinAdapterConfig = adapterConfig;
     return super.joinSession(
       serverHost: serverHost,
@@ -862,6 +902,7 @@ class _CapturingMockClient extends MockBackendClient {
       playerName: playerName,
       gameServerHost: gameServerHost,
       gameServerPort: gameServerPort,
+      forceRelay: forceRelay,
       adapterConfig: adapterConfig,
     );
   }
@@ -898,6 +939,7 @@ class _StaleCreateRoomMockClient extends MockBackendClient {
     required int gameServerPort,
     required String bindHost,
     required int bindPort,
+    bool forceRelay = true,
     AdapterConfig? adapterConfig,
   }) async {
     return _session(
@@ -981,6 +1023,7 @@ class _StaleCreateRoomMockClient extends MockBackendClient {
       adapterPort: 40000,
       gameServerHost: '127.0.0.1',
       gameServerPort: 0,
+      forceRelay: true,
       createdAt: _now,
       updatedAt: _now,
       stats: SessionStats.empty(),
@@ -1044,6 +1087,7 @@ class _AdapterStatusMockClient extends MockBackendClient {
     required int gameServerPort,
     required String bindHost,
     required int bindPort,
+    bool forceRelay = true,
     AdapterConfig? adapterConfig,
   }) async {
     return _session(
@@ -1096,6 +1140,7 @@ class _AdapterStatusMockClient extends MockBackendClient {
       adapterPort: 0,
       gameServerHost: '127.0.0.1',
       gameServerPort: 0,
+      forceRelay: true,
       createdAt: _now,
       updatedAt: _now,
       stats: SessionStats.empty(),

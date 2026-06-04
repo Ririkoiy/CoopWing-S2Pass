@@ -140,6 +140,19 @@ class AdapterManagerTests(unittest.TestCase):
         finally:
             manager.stop("s_test")
 
+    def test_udp_profile_keeps_protocol_udp(self):
+        manager = AdapterManager(
+            transport_factory=lambda session_id, config: FakePairTransport(),
+        )
+        manager.configure("s_test", AdapterConfig(enabled=True))
+
+        status = manager.start("s_test")
+        try:
+            self.assertEqual(status.adapter_type, "local_udp_bridge")
+            self.assertEqual(manager._adapters["s_test"].profile.protocol, "udp")
+        finally:
+            manager.stop("s_test")
+
     def test_attach_transport_stores_opaque_transport_for_start(self):
         transport = FakePairTransport()
         manager = AdapterManager()

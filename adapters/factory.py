@@ -8,12 +8,14 @@ from adapters.base import AdapterBase
 from adapters.launch_adapter import LaunchAdapter
 from adapters.profile import GameProfile
 from adapters.tcp_adapter import GenericTcpForwardAdapter
+from adapters.tcp_relay_adapter import TcpRelayAdapter
 from adapters.udp_adapter import GenericUdpForwardAdapter
 
 _ADAPTER_TYPE_MAP = {
     "launch_only": LaunchAdapter,
     "generic_udp_forward": GenericUdpForwardAdapter,
     "tcp_forward": GenericTcpForwardAdapter,
+    "tcp_relay": TcpRelayAdapter,
 }
 
 

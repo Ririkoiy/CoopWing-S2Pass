@@ -138,14 +138,6 @@ class _BackendHandler(BaseHTTPRequestHandler):
         body = self._read_body()
         if body is None:
             return
-        if "game_server_port" not in body:
-            self._send_error(
-                400,
-                "INVALID_REQUEST",
-                "Missing or invalid field: game_server_port",
-                {"field": "game_server_port"},
-            )
-            return
         try:
             info = self.manager.create_session(body)
         except BackendError as exc:

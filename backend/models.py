@@ -9,7 +9,12 @@ from typing import Any, Dict, List, Optional
 
 ADAPTER_TYPE_LOCAL_UDP_BRIDGE = "local_udp_bridge"
 ADAPTER_TYPE_TCP_FORWARD = "tcp_forward"
-_VALID_ADAPTER_TYPES = {ADAPTER_TYPE_LOCAL_UDP_BRIDGE, ADAPTER_TYPE_TCP_FORWARD}
+ADAPTER_TYPE_TCP_RELAY = "tcp_relay"
+_VALID_ADAPTER_TYPES = {
+    ADAPTER_TYPE_LOCAL_UDP_BRIDGE,
+    ADAPTER_TYPE_TCP_FORWARD,
+    ADAPTER_TYPE_TCP_RELAY,
+}
 ADAPTER_STATUS_DISABLED = "disabled"
 ADAPTER_STATUS_INITIALIZING = "initializing"
 ADAPTER_STATUS_READY = "ready"
@@ -134,6 +139,7 @@ class AdapterStatus:
     target_port: Optional[int] = None
     counters: AdapterCounters = dataclasses.field(default_factory=AdapterCounters)
     error: Optional[Dict[str, str]] = None
+    payload_diagnostics: Optional[Dict[str, Any]] = None
 
     @classmethod
     def disabled(cls) -> "AdapterStatus":
@@ -177,6 +183,8 @@ class AdapterStatus:
             })
             if self.target_port is not None:
                 d["target_port"] = self.target_port
+            if self.payload_diagnostics is not None:
+                d["payload_diagnostics"] = self.payload_diagnostics
         return d
 
 

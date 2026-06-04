@@ -221,15 +221,14 @@ class TestCreateSessionEndpoint(HTTPTestBase):
         self.assertIn("error", data)
         self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
 
-    def test_create_missing_game_server_port_returns_400(self):
+    def test_create_missing_game_server_port_keeps_udp_preview_compat(self):
         status, data = self.req("POST", "/sessions/create", {
             "server_host": "192.168.1.10",
             "player_name": "CreatorA",
             "__omit_game_server_port": True,
         })
-        self.assertEqual(status, 400)
-        self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
-        self.assertEqual(data["error"]["details"]["field"], "game_server_port")
+        self.assertEqual(status, 201)
+        self.assertNotIn("game_server_port", data)
 
     def test_create_invalid_server_port_returns_400(self):
         status, data = self.req("POST", "/sessions/create", {
@@ -263,6 +262,66 @@ class TestCreateSessionEndpoint(HTTPTestBase):
         })
         self.assertEqual(status, 201)
         self.assertEqual(data["adapter_status"]["status"], "stopped")
+        self.assertEqual(data["adapter_status"]["adapter_type"], "local_udp_bridge")
+
+    def test_create_udp_adapter_config_is_not_tcp_forward(self):
+        status, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "game_server_port": 27015,
+            "force_relay": True,
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "local_udp_bridge",
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "target_host": "127.0.0.1",
+                "target_port": 27015,
+            },
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(data["adapter_status"]["adapter_type"], "local_udp_bridge")
+        self.assertNotEqual(data["adapter_status"]["adapter_type"], "tcp_forward")
+        self.assertTrue(data["force_relay"])
+
+    def test_create_adapter_target_mismatch_returns_400_with_reason(self):
+        status, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "game_server_port": 27015,
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "local_udp_bridge",
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "target_host": "127.0.0.1",
+                "target_port": 27016,
+            },
+        })
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
+        self.assertEqual(data["error"]["details"]["field"], "adapter_config.target_port")
+        self.assertEqual(data["error"]["details"]["game_server_port"], 27015)
+        self.assertEqual(data["error"]["details"]["target_port"], 27016)
+
+    def test_create_with_tcp_forward_adapter_config_returns_success(self):
+        status, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "game_server_port": 25565,
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "tcp_forward",
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "target_host": "127.0.0.1",
+                "target_port": 25565,
+            },
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(data["adapter_status"]["adapter_type"], "tcp_forward")
+        self.assertGreater(data["adapter_status"]["bind_port"], 0)
+        self.assertEqual(data["adapter_status"]["target_port"], 25565)
 
     def test_create_with_invalid_adapter_config_returns_400(self):
         status, data = self.req("POST", "/sessions/create", {

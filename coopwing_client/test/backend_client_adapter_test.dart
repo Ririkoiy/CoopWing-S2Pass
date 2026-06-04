@@ -128,6 +128,43 @@ void main() {
     });
 
     test(
+      'UDP Experimental adds expected adapter_config to create request',
+      () async {
+        final capture = await _withCaptureServer((client) {
+          return client.createSession(
+            serverHost: '127.0.0.1',
+            serverPort: 9000,
+            serverUdpPort: 9001,
+            playerName: 'Alice',
+            gameServerPort: 27015,
+            bindHost: '127.0.0.1',
+            bindPort: 0,
+            adapterConfig: AdapterConfig.udpExperimental(
+              targetHost: '127.0.0.1',
+              targetPort: 27015,
+            ),
+          );
+        });
+
+        expect(capture.path, '/sessions/create');
+        expect(capture.body['game_server_port'], 27015);
+        expect(capture.body['adapter_config'], {
+          'enabled': true,
+          'adapter_type': 'local_udp_bridge',
+          'bind_host': '127.0.0.1',
+          'bind_port': 0,
+          'target_host': '127.0.0.1',
+          'target_port': 27015,
+        });
+        expect(
+          (capture.body['adapter_config']!
+              as Map<String, Object?>)['adapter_type'],
+          isNot('tcp_forward'),
+        );
+      },
+    );
+
+    test(
       'UDP Experimental adds expected adapter_config to join request',
       () async {
         final capture = await _withCaptureServer((client) {
@@ -158,6 +195,95 @@ void main() {
           'bind_port': 0,
           'target_host': '127.0.0.1',
         });
+      },
+    );
+
+    test('TCP Relay adds expected adapter_config to create request', () async {
+      final capture = await _withCaptureServer((client) {
+        return client.createSession(
+          serverHost: '127.0.0.1',
+          serverPort: 9000,
+          serverUdpPort: 9001,
+          playerName: 'Alice',
+          gameServerPort: 25565,
+          bindHost: '127.0.0.1',
+          bindPort: 0,
+          adapterConfig: AdapterConfig.tcpRelay(
+            targetHost: '127.0.0.1',
+            targetPort: 25565,
+          ),
+        );
+      });
+
+      expect(capture.path, '/sessions/create');
+      expect(capture.body['game_server_port'], 25565);
+      expect(capture.body['adapter_config'], {
+        'enabled': true,
+        'adapter_type': 'tcp_relay',
+        'bind_host': '127.0.0.1',
+        'bind_port': 0,
+        'target_host': '127.0.0.1',
+        'target_port': 25565,
+      });
+    });
+
+    test('TCP Relay adds expected adapter_config to join request', () async {
+      final capture = await _withCaptureServer((client) {
+        return client.joinSession(
+          serverHost: '127.0.0.1',
+          serverPort: 9000,
+          serverUdpPort: 9001,
+          roomId: 'ABC234',
+          playerName: 'Bob',
+          gameServerHost: '127.0.0.1',
+          adapterConfig: AdapterConfig.tcpRelay(),
+        );
+      });
+
+      expect(capture.path, '/sessions/join');
+      expect(capture.body['adapter_config'], {
+        'enabled': true,
+        'adapter_type': 'tcp_relay',
+        'bind_host': '127.0.0.1',
+        'bind_port': 0,
+        'target_host': '127.0.0.1',
+      });
+    });
+
+    test(
+      'TCP Forward adds expected adapter_config to create request',
+      () async {
+        final capture = await _withCaptureServer((client) {
+          return client.createSession(
+            serverHost: '127.0.0.1',
+            serverPort: 9000,
+            serverUdpPort: 9001,
+            playerName: 'Alice',
+            gameServerPort: 25565,
+            bindHost: '127.0.0.1',
+            bindPort: 0,
+            adapterConfig: AdapterConfig.tcpForward(
+              targetHost: '127.0.0.1',
+              targetPort: 25565,
+            ),
+          );
+        });
+
+        expect(capture.path, '/sessions/create');
+        expect(capture.body['game_server_port'], 25565);
+        expect(capture.body['adapter_config'], {
+          'enabled': true,
+          'adapter_type': 'tcp_forward',
+          'bind_host': '127.0.0.1',
+          'bind_port': 0,
+          'target_host': '127.0.0.1',
+          'target_port': 25565,
+        });
+        expect(
+          (capture.body['adapter_config']!
+              as Map<String, Object?>)['target_port'],
+          isNot(25566),
+        );
       },
     );
 

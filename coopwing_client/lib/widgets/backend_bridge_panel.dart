@@ -11,7 +11,7 @@ import '../services/localization.dart';
 
 enum _SessionMode { create, join }
 
-enum _AdapterMode { off, udpExperimental }
+enum _AdapterMode { off, udpExperimental, tcpRelay, tcpForward }
 
 class BackendBridgePanel extends StatefulWidget {
   const BackendBridgePanel({
@@ -843,10 +843,21 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     if (targetPort != null) {
       _adapterTargetPortController.text = targetPort.toString();
     }
-    return AdapterConfig.udpExperimental(
-      targetHost: targetHost,
-      targetPort: targetPort,
-    );
+    return switch (_adapterMode) {
+      _AdapterMode.udpExperimental => AdapterConfig.udpExperimental(
+        targetHost: targetHost,
+        targetPort: targetPort,
+      ),
+      _AdapterMode.tcpRelay => AdapterConfig.tcpRelay(
+        targetHost: targetHost,
+        targetPort: targetPort,
+      ),
+      _AdapterMode.tcpForward => AdapterConfig.tcpForward(
+        targetHost: targetHost,
+        targetPort: targetPort,
+      ),
+      _AdapterMode.off => null,
+    };
   }
 
   BackendError _actionError(String action, BackendError error) {
@@ -1831,6 +1842,14 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
                       value: _AdapterMode.udpExperimental,
                       child: Text(loc.get('adapter_udp_experimental')),
                     ),
+                    DropdownMenuItem<_AdapterMode>(
+                      value: _AdapterMode.tcpRelay,
+                      child: Text(loc.get('adapter_tcp_relay')),
+                    ),
+                    DropdownMenuItem<_AdapterMode>(
+                      value: _AdapterMode.tcpForward,
+                      child: Text(loc.get('adapter_tcp_forward')),
+                    ),
                   ],
                   onChanged: controlsEnabled
                       ? (mode) {
@@ -1841,15 +1860,18 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
                       : null,
                 ),
               ),
+              if (adapterMode == _AdapterMode.tcpRelay)
+                SizedBox(
+                  width: 430,
+                  child: _HelperText(text: loc.get('adapter_tcp_relay_helper')),
+                ),
               SizedBox(
                 width: 210,
                 child: _Field(
                   controller: adapterTargetHostController,
                   label: loc.get('adapter_target_host'),
                   helperText: loc.get('default_host_127'),
-                  enabled:
-                      controlsEnabled &&
-                      adapterMode == _AdapterMode.udpExperimental,
+                  enabled: controlsEnabled && adapterMode != _AdapterMode.off,
                 ),
               ),
             ],
@@ -1898,17 +1920,24 @@ String _adapterStatusLabel(AdapterStatus status) {
 }
 
 String? _adapterBindAddress(AdapterStatus? status) {
-  if (status?.bindHost == null || status?.bindPort == null) {
+  final bindHost = status?.bindHost;
+  final bindPort = status?.bindPort;
+  if (status?.status != 'ready' ||
+      bindHost == null ||
+      bindPort == null ||
+      bindPort <= 0) {
     return null;
   }
-  return '${status!.bindHost}:${status.bindPort}';
+  return '$bindHost:$bindPort';
 }
 
 String? _adapterTargetAddress(AdapterStatus? status) {
-  if (status?.targetHost == null || status?.targetPort == null) {
+  final targetHost = status?.targetHost;
+  final targetPort = status?.targetPort;
+  if (targetHost == null || targetPort == null || targetPort <= 0) {
     return null;
   }
-  return '${status!.targetHost}:${status.targetPort}';
+  return '$targetHost:$targetPort';
 }
 
 bool _sessionStatusNeedsPolling(String status) {

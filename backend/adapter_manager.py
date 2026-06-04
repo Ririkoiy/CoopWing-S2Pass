@@ -13,12 +13,14 @@ from adapters.base import AdapterBase
 from adapters.local_udp_bridge_adapter import LocalUdpBridgeAdapter
 from adapters.profile import GameProfile
 from adapters.tcp_adapter import GenericTcpForwardAdapter
+from adapters.tcp_relay_adapter import TcpRelayAdapter
 from adapters.transport import Transport
 from backend.models import (
     ADAPTER_STATUS_ERROR,
     ADAPTER_STATUS_READY,
     ADAPTER_STATUS_STOPPED,
     ADAPTER_TYPE_TCP_FORWARD,
+    ADAPTER_TYPE_TCP_RELAY,
     AdapterConfig,
     AdapterCounters,
     AdapterStatus,
@@ -97,6 +99,7 @@ class AdapterManager:
             if session_id in self._adapters:
                 return self._snapshot_locked(session_id)
             is_tcp = config.adapter_type == ADAPTER_TYPE_TCP_FORWARD
+            is_tcp_relay = config.adapter_type == ADAPTER_TYPE_TCP_RELAY
 
         # --- TCP forward path (no transport needed) ---
         if is_tcp:
@@ -131,7 +134,7 @@ class AdapterManager:
                 self._statuses[session_id] = ready
                 return self._snapshot_locked(session_id)
 
-        # --- UDP bridge path (needs transport) ---
+        # --- Transport-backed paths (UDP bridge or TCP relay) ---
         with self._lock:
             transport = self._transports.get(session_id)
             transport_factory = None if transport is not None else self._transport_factory
@@ -159,14 +162,17 @@ class AdapterManager:
             self._close_transport(old_transport)
 
         profile = self._profile_from_config(session_id, config)
-        fixed_local_target_addr = None
-        if config.target_port is not None:
-            fixed_local_target_addr = (config.target_host, config.target_port)
-        adapter = LocalUdpBridgeAdapter(
-            profile=profile,
-            transport=transport,
-            fixed_local_target_addr=fixed_local_target_addr,
-        )
+        if is_tcp_relay:
+            adapter = TcpRelayAdapter(profile=profile, transport=transport)
+        else:
+            fixed_local_target_addr = None
+            if config.target_port is not None:
+                fixed_local_target_addr = (config.target_host, config.target_port)
+            adapter = LocalUdpBridgeAdapter(
+                profile=profile,
+                transport=transport,
+                fixed_local_target_addr=fixed_local_target_addr,
+            )
 
         try:
             adapter.start()
@@ -250,6 +256,12 @@ class AdapterManager:
                         bytes_from_transport=getattr(adapter, "bytes_from_transport", 0),
                         bytes_to_game=getattr(adapter, "bytes_to_game", 0),
                     )
+            # Collect transport-layer payload diagnostics if available
+            transport = getattr(adapter, "transport", None)
+            if transport is not None:
+                diag_fn = getattr(transport, "get_payload_diagnostics", None)
+                if diag_fn is not None:
+                    status.payload_diagnostics = diag_fn()
         return status
 
     def _set_error(
@@ -269,11 +281,18 @@ class AdapterManager:
             return error_status
 
     def _profile_from_config(self, session_id: str, config: AdapterConfig) -> GameProfile:
+        if config.adapter_type == ADAPTER_TYPE_TCP_FORWARD:
+            protocol = ""
+        elif config.adapter_type == ADAPTER_TYPE_TCP_RELAY:
+            protocol = "tcp"
+        else:
+            protocol = "udp"
         return GameProfile(
             profile_id=session_id,
             display_name=f"Adapter {session_id}",
             exe_path="",
             adapter_type=config.adapter_type,
+            protocol=protocol,
             local_bind_host=config.bind_host,
             local_bind_port=config.bind_port,
             remote_target_host=config.target_host,

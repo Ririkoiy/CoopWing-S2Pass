@@ -68,13 +68,14 @@ class TestCoreTransportAdapter(unittest.TestCase):
         self.assertEqual(str(ctx.exception), "callback error")
 
     def test_send_schedules_via_call_soon_threadsafe(self):
-        """send(payload) schedules core.send_payload(payload) through loop.call_soon_threadsafe."""
+        """send(payload) schedules a wrapped call through loop.call_soon_threadsafe."""
         core = FakeCore()
         loop = FakeLoop()
-        # Create a loop that records but does not call immediately to verify scheduling format
         loop.calls = []
         def record_only(callback, *args, **kwargs):
             loop.calls.append((callback, args, kwargs))
+            # Execute immediately so we can verify core.send_payload was called
+            callback(*args, **kwargs)
         loop.call_soon_threadsafe = record_only
 
         adapter = CoreTransportAdapter(core, loop)
@@ -82,9 +83,14 @@ class TestCoreTransportAdapter(unittest.TestCase):
         adapter.send(payload_bytes)
 
         self.assertEqual(len(loop.calls), 1)
-        func, args, kwargs = loop.calls[0]
-        self.assertEqual(func, core.send_payload)
-        self.assertEqual(args, (payload_bytes,))
+        _func, _args, _kwargs = loop.calls[0]
+        # The wrapped callback is a local function _safe_send, not core.send_payload directly.
+        # Verify core.send_payload was called with the correct payload.
+        self.assertEqual(core.sent_payloads, [payload_bytes])
+        # Verify diagnostic counters
+        self.assertEqual(adapter.send_attempts, 1)
+        self.assertEqual(adapter.send_scheduled, 1)
+        self.assertEqual(adapter.send_exceptions, 0)
 
     def test_send_preserves_bytes_exactly(self):
         """send(payload) preserves bytes exactly."""

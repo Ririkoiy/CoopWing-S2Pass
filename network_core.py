@@ -182,18 +182,44 @@ class S2PassClientCore:
         self.received_echoes: Dict[int, float] = {}    # seq -> rtt
         self.has_error = False
 
+        # ── Payload-mode send-path diagnostics (v0.2 live-debug) ──
+        self.payload_send_attempts: int = 0
+        self.payload_send_bytes: int = 0
+        self.udp_relay_send_attempts: int = 0
+        self.udp_relay_send_bytes: int = 0
+        self.udp_relay_send_noop_no_transport: int = 0
+        self.udp_relay_send_noop_no_target: int = 0
+        self.udp_relay_send_exceptions: int = 0
+        self.last_payload_send_error: Optional[str] = None
+
+        # ── Payload-mode receive-path diagnostics (v0.2 live-debug) ──
+        self.relay_packets_received: int = 0
+        self.relay_payload_callback_calls: int = 0
+        self.relay_payload_callback_bytes: int = 0
+        self.relay_drop_not_relay_prefix: int = 0
+        self.relay_drop_invalid_header: int = 0
+        self.relay_drop_token_mismatch: int = 0
+        self.relay_drop_no_callback: int = 0
+        self.last_relay_receive_error: Optional[str] = None
+
     def set_payload_callback(self, callback: Callable[[bytes], None]) -> None:
         """Set a callback to be invoked when a raw peer payload is received."""
         self._payload_callback = callback
 
     def send_payload(self, payload: bytes) -> None:
         """Send a raw payload byte stream to the peer via the relay path."""
+        self.payload_send_attempts += 1
+        self.payload_send_bytes += len(payload)
+
         if not self.config.is_payload_mode:
-            raise RuntimeError("Cannot send payload when not in payload mode")
+            self.last_payload_send_error = "Cannot send payload when not in payload mode"
+            raise RuntimeError(self.last_payload_send_error)
         if not self.relay_token or not self._relay_target_host or not self._relay_target_port:
-            raise RuntimeError("Relay path is not ready. Relay token or target is missing.")
+            self.last_payload_send_error = "Relay path is not ready. Relay token or target is missing."
+            raise RuntimeError(self.last_payload_send_error)
         if not self._udp_transport:
-            raise RuntimeError("UDP transport is not initialized.")
+            self.last_payload_send_error = "UDP transport is not initialized."
+            raise RuntimeError(self.last_payload_send_error)
 
         packet = self._build_relay_packet(payload)
         self._send_udp_to_relay(packet)
@@ -284,10 +310,21 @@ class S2PassClientCore:
 
     def _send_udp_to_relay(self, packet: bytes):
         """Send UDP packet to resolved relay target."""
-        if self._udp_transport and self._relay_target_host and self._relay_target_port:
+        self.udp_relay_send_attempts += 1
+        if not self._udp_transport:
+            self.udp_relay_send_noop_no_transport += 1
+            return
+        if not self._relay_target_host or not self._relay_target_port:
+            self.udp_relay_send_noop_no_target += 1
+            return
+        try:
             self._udp_transport.sendto(
                 packet, (self._relay_target_host, self._relay_target_port)
             )
+            self.udp_relay_send_bytes += len(packet)
+        except OSError as exc:
+            self.udp_relay_send_exceptions += 1
+            self.last_payload_send_error = f"UDP sendto failed: {exc}"
 
     # ===================================================================
     # relay_ip fallback (old L146-156)
@@ -310,14 +347,19 @@ class S2PassClientCore:
     def _handle_udp_packet(self, data: bytes, addr: tuple):
         """Handle incoming UDP packet. Strictly RELAY\\n prefix only."""
         if not data.startswith(b"RELAY\n"):
+            self.relay_drop_not_relay_prefix += 1
             return
         relay_data = data[6:]
         newline_pos = relay_data.find(b'\n')
         if newline_pos < 0:
+            self.relay_drop_invalid_header += 1
+            self.last_relay_receive_error = "No newline in RELAY header"
             return
         try:
             header = json.loads(relay_data[:newline_pos].decode('utf-8'))
-        except (json.JSONDecodeError, UnicodeDecodeError):
+        except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+            self.relay_drop_invalid_header += 1
+            self.last_relay_receive_error = f"JSON decode failed: {exc}"
             return
 
         relay_token = header.get("relay_token")
@@ -325,8 +367,11 @@ class S2PassClientCore:
 
         # Verify relay token consistency
         if self.relay_token and relay_token != self.relay_token:
+            self.relay_drop_token_mismatch += 1
+            self.last_relay_receive_error = "relay_token mismatch"
             return
 
+        self.relay_packets_received += 1
         binary_payload = relay_data[newline_pos + 1:]
         self._on_relay_packet(sender_id, binary_payload)
 
@@ -334,7 +379,12 @@ class S2PassClientCore:
         """Handle relay payload. (old L117-144)"""
         if self.config.is_payload_mode:
             if self._payload_callback:
+                self.relay_payload_callback_calls += 1
+                self.relay_payload_callback_bytes += len(binary_payload)
                 self._payload_callback(binary_payload)
+            else:
+                self.relay_drop_no_callback += 1
+                self.last_relay_receive_error = "No payload callback registered"
             return
 
         if self.config.send_test:

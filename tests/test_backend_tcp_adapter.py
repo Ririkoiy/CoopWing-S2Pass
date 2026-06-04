@@ -19,6 +19,8 @@ import unittest
 from typing import Optional
 
 from adapters.tcp_adapter import GenericTcpForwardAdapter
+from adapters.tcp_relay_adapter import TcpRelayAdapter
+from adapters.transport import make_fake_pair
 from backend.adapter_manager import AdapterManager
 from backend.models import AdapterConfig
 
@@ -160,6 +162,7 @@ class BackendTcpAdapterIntegrationTests(unittest.TestCase):
             self.assertEqual(status.target_host, self.echo.host)
             self.assertEqual(status.target_port, self.echo.port)
             self.assertIsNone(status.error)
+            self.assertEqual(manager._adapters["s_tcp"].profile.protocol, "")
         finally:
             manager.stop("s_tcp")
 
@@ -300,6 +303,58 @@ class BackendTcpAdapterIntegrationTests(unittest.TestCase):
             })
         self.assertIn("adapter_type", ctx.exception.message)
 
+    def test_tcp_relay_creator_uses_transport_and_no_local_listener(self):
+        transport, _ = make_fake_pair()
+        manager = AdapterManager(transport_factory=lambda sid, cfg: transport)
+        config = AdapterConfig(
+            enabled=True,
+            adapter_type="tcp_relay",
+            bind_host="127.0.0.1",
+            bind_port=0,
+            target_host=self.echo.host,
+            target_port=self.echo.port,
+        )
+        manager.configure("s_tcp_relay_creator", config)
+
+        status = manager.start("s_tcp_relay_creator")
+        try:
+            self.assertEqual(status.status, "ready")
+            self.assertEqual(status.adapter_type, "tcp_relay")
+            self.assertEqual(status.bind_port, 0)
+            self.assertEqual(status.target_port, self.echo.port)
+            self.assertIsInstance(
+                manager._adapters["s_tcp_relay_creator"],
+                TcpRelayAdapter,
+            )
+            self.assertEqual(
+                manager._adapters["s_tcp_relay_creator"].profile.protocol,
+                "tcp",
+            )
+        finally:
+            manager.stop("s_tcp_relay_creator")
+
+    def test_tcp_relay_joiner_uses_transport_and_local_listener(self):
+        transport, _ = make_fake_pair()
+        manager = AdapterManager(transport_factory=lambda sid, cfg: transport)
+        config = AdapterConfig(
+            enabled=True,
+            adapter_type="tcp_relay",
+            bind_host="127.0.0.1",
+            bind_port=0,
+            target_host="127.0.0.1",
+            target_port=None,
+        )
+        manager.configure("s_tcp_relay_joiner", config)
+
+        status = manager.start("s_tcp_relay_joiner")
+        try:
+            self.assertEqual(status.status, "ready")
+            self.assertEqual(status.adapter_type, "tcp_relay")
+            self.assertGreater(status.bind_port, 0)
+            self.assertIsNone(status.target_port)
+        finally:
+            manager.stop("s_tcp_relay_joiner")
+
 
 class AdapterFactoryTests(unittest.TestCase):
     """Test the adapter factory directly."""
@@ -322,6 +377,23 @@ class AdapterFactoryTests(unittest.TestCase):
         self.assertIsInstance(adapter, GenericTcpForwardAdapter)
         self.assertEqual(adapter._target_host, "127.0.0.1")
         self.assertEqual(adapter._target_port, 9999)
+
+    def test_factory_creates_tcp_relay_adapter_with_transport(self):
+        from adapters.factory import create_adapter
+        from adapters.profile import GameProfile
+        from adapters.transport import FakePairTransport
+
+        profile = GameProfile(
+            profile_id="test_tcp_relay",
+            display_name="Test TCP Relay",
+            exe_path="",
+            adapter_type="tcp_relay",
+            local_bind_host="127.0.0.1",
+            local_bind_port=0,
+            remote_target_host="127.0.0.1",
+        )
+        adapter = create_adapter(profile, transport=FakePairTransport())
+        self.assertIsInstance(adapter, TcpRelayAdapter)
 
     def test_factory_unknown_type_raises(self):
         from adapters.factory import create_adapter

@@ -154,6 +154,38 @@ class AdapterConfig {
     );
   }
 
+  factory AdapterConfig.tcpForward({
+    String bindHost = '127.0.0.1',
+    int bindPort = 0,
+    String targetHost = '127.0.0.1',
+    int? targetPort,
+  }) {
+    return AdapterConfig(
+      enabled: true,
+      adapterType: 'tcp_forward',
+      bindHost: bindHost,
+      bindPort: bindPort,
+      targetHost: targetHost,
+      targetPort: targetPort,
+    );
+  }
+
+  factory AdapterConfig.tcpRelay({
+    String bindHost = '127.0.0.1',
+    int bindPort = 0,
+    String targetHost = '127.0.0.1',
+    int? targetPort,
+  }) {
+    return AdapterConfig(
+      enabled: true,
+      adapterType: 'tcp_relay',
+      bindHost: bindHost,
+      bindPort: bindPort,
+      targetHost: targetHost,
+      targetPort: targetPort,
+    );
+  }
+
   Map<String, Object?> toJson() {
     return {
       'enabled': enabled,

@@ -268,6 +268,10 @@ class Localization extends ChangeNotifier {
       'adapter_mode': '适配器模式',
       'adapter_off': '关闭',
       'adapter_udp_experimental': 'UDP 实验模式',
+      'adapter_tcp_relay': 'TCP Relay 实验模式',
+      'adapter_tcp_forward': 'Local TCP Forward',
+      'adapter_tcp_relay_helper':
+          '通过房间/Relay 转发 TCP 流量，适合 Minecraft Java dedicated server 这类 TCP server 测试。',
       'force_relay': '强制中继',
       'adapter_target_host': '游戏服务器主机',
       'adapter_target_port': '游戏服务器端口',
@@ -545,6 +549,10 @@ class Localization extends ChangeNotifier {
       'adapter_mode': 'Adapter mode',
       'adapter_off': 'Off',
       'adapter_udp_experimental': 'UDP Experimental',
+      'adapter_tcp_relay': 'TCP Relay Experimental',
+      'adapter_tcp_forward': 'Local TCP Forward',
+      'adapter_tcp_relay_helper':
+          'Forwards TCP traffic through the room/Relay, suitable for testing TCP servers such as a Minecraft Java dedicated server.',
       'force_relay': 'Force Relay',
       'adapter_target_host': 'Game server host',
       'adapter_target_port': 'Game server port',

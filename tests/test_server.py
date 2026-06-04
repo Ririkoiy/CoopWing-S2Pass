@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import sys
 import time
@@ -76,6 +77,14 @@ def _make_room(
         joiner_id=joiner_id,
         created_at=time.monotonic(),
     )
+
+
+def _make_relay_raw_data(relay_token: str, player_id: str, payload: bytes) -> memoryview:
+    header = json.dumps(
+        {"relay_token": relay_token, "player_id": player_id},
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return memoryview(header + b"\n" + payload)
 
 
 class _ServerTestBase(unittest.IsolatedAsyncioTestCase):
@@ -205,6 +214,83 @@ class TestP2PJudgment(_ServerTestBase):
         # 直接调用 _switch_to_relay 模拟超时
         await self.server._switch_to_relay(room)
         self.assertEqual(room.state, srv.STATE_RELAY)
+
+    async def test_same_ip_creator_joiner_use_one_relay_session_reservation(self) -> None:
+        """A same-public-IP pair can enter Relay without a false 1007."""
+        server = srv.P2PServer(relay_max_sessions_per_ip=1)
+        server._loop = asyncio.get_event_loop()
+        same_ip = "198.51.100.10"
+        creator = _make_player(
+            player_id="p_aaaaaaaaaaaa",
+            player_name="Alice",
+            room_id="ABCDEF",
+            tcp_ip=same_ip,
+        )
+        joiner = _make_player(
+            player_id="p_bbbbbbbbbbbb",
+            player_name="Bob",
+            room_id="ABCDEF",
+            tcp_ip=same_ip,
+        )
+        room = _make_room(
+            room_id="ABCDEF",
+            state=srv.STATE_PUNCHING,
+            creator_id=creator.player_id,
+            joiner_id=joiner.player_id,
+        )
+        server._players[creator.player_id] = creator
+        server._players[joiner.player_id] = joiner
+        server._rooms[room.room_id] = room
+
+        await server._switch_to_relay(room)
+
+        self.assertEqual(room.state, srv.STATE_RELAY)
+        self.assertEqual(server._rate_limiter._relay_per_ip[same_ip], 1)
+        self.assertEqual(room.relay_session.reserved_ips, (same_ip,))
+
+        await server._close_room(room.room_id, reason="test")
+        self.assertNotIn(same_ip, server._rate_limiter._relay_per_ip)
+
+    async def test_global_relay_capacity_keeps_error_code_1007(self) -> None:
+        """Capacity rejection keeps the frozen RELAY_UNAVAILABLE response."""
+        server = srv.P2PServer(relay_max_sessions=1)
+        server._loop = asyncio.get_event_loop()
+        server._relay_sessions["rtk_0123456789abcdef"] = srv.RelaySession(
+            relay_token="rtk_0123456789abcdef",
+            room_id="EXIST1",
+            player_a_id="p_111111111111",
+            player_b_id="p_222222222222",
+        )
+        creator = _make_player(
+            player_id="p_aaaaaaaaaaaa",
+            player_name="Alice",
+            room_id="ABCDEF",
+            tcp_ip="198.51.100.11",
+        )
+        joiner = _make_player(
+            player_id="p_bbbbbbbbbbbb",
+            player_name="Bob",
+            room_id="ABCDEF",
+            tcp_ip="198.51.100.12",
+        )
+        room = _make_room(
+            room_id="ABCDEF",
+            state=srv.STATE_PUNCHING,
+            creator_id=creator.player_id,
+            joiner_id=joiner.player_id,
+        )
+        server._players[creator.player_id] = creator
+        server._players[joiner.player_id] = joiner
+        server._rooms[room.room_id] = room
+
+        await server._switch_to_relay(room)
+
+        self.assertEqual(room.state, srv.STATE_PUNCHING)
+        for writer in (creator.tcp_writer, joiner.tcp_writer):
+            written = writer.write.call_args[0][0]
+            message = json.loads(written.decode("utf-8"))
+            self.assertEqual(message["type"], srv.MSG_ERROR)
+            self.assertEqual(message["payload"]["code"], 1007)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -583,6 +669,80 @@ class TestRelayRateLimit(_ServerTestBase):
         self.assertIsInstance(session.bandwidth_window_start, float)
         self.assertIsInstance(session.bandwidth_bytes, int)
 
+    def _install_relay_path(
+        self,
+        server: srv.P2PServer,
+        session: srv.RelaySession,
+    ) -> MagicMock:
+        transport = MagicMock()
+        server._udp_transport = transport
+        server._relay_sessions[session.relay_token] = session
+        server._players[session.player_a_id] = _make_player(
+            player_id=session.player_a_id,
+            udp_addr=("198.51.100.20", 5000),
+        )
+        server._players[session.player_b_id] = _make_player(
+            player_id=session.player_b_id,
+            udp_addr=("198.51.100.21", 5001),
+        )
+        return transport
+
+    def test_default_token_bucket_accepts_minecraft_like_burst(self) -> None:
+        """Default burst accepts more than a 64KB TCP Relay round trip."""
+        server = srv.P2PServer()
+        session = self._make_relay_session()
+        session.bandwidth_tokens = float(server._relay_burst_bytes)
+        session.bandwidth_last_refill = time.monotonic()
+        transport = self._install_relay_path(server, session)
+        payload = b"x" * 1000
+
+        for _ in range(200):
+            server.handle_udp_relay(
+                _make_relay_raw_data(session.relay_token, session.player_a_id, payload),
+                ("198.51.100.20", 5000),
+            )
+
+        self.assertEqual(transport.sendto.call_count, 200)
+        self.assertEqual(session.dropped_packets, 0)
+        self.assertGreater(server._relay_burst_bytes, 128 * 1024)
+
+    def test_low_token_bucket_limit_drops_with_counters(self) -> None:
+        """Configured low capacity still drops and records the reason server-side."""
+        server = srv.P2PServer(relay_bytes_per_second=100, relay_burst_bytes=100)
+        session = self._make_relay_session()
+        session.bandwidth_tokens = float(server._relay_burst_bytes)
+        session.bandwidth_last_refill = time.monotonic()
+        transport = self._install_relay_path(server, session)
+        payload = b"x" * 101
+
+        server.handle_udp_relay(
+            _make_relay_raw_data(session.relay_token, session.player_a_id, payload),
+            ("198.51.100.20", 5000),
+        )
+
+        transport.sendto.assert_not_called()
+        self.assertEqual(session.dropped_packets, 1)
+        self.assertEqual(session.dropped_bytes, len(payload))
+
+    def test_udp_relay_forwarding_format_unchanged(self) -> None:
+        """The existing UDP RELAY packet path still forwards the same payload."""
+        server = srv.P2PServer()
+        session = self._make_relay_session()
+        session.bandwidth_tokens = float(server._relay_burst_bytes)
+        session.bandwidth_last_refill = time.monotonic()
+        transport = self._install_relay_path(server, session)
+        payload = b"legacy-udp-payload"
+
+        server.handle_udp_relay(
+            _make_relay_raw_data(session.relay_token, session.player_a_id, payload),
+            ("198.51.100.20", 5000),
+        )
+
+        forwarded, target = transport.sendto.call_args[0]
+        self.assertTrue(forwarded.startswith(b"RELAY\n"))
+        self.assertTrue(forwarded.endswith(payload))
+        self.assertEqual(target, ("198.51.100.21", 5001))
+
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 7. HEARTBEAT 测试
@@ -679,6 +839,15 @@ class TestProtocolCompliance(_ServerTestBase):
         self.assertEqual(srv._RELAY_IDLE_TIMEOUT_SECONDS, 1800)
         self.assertEqual(srv.RELAY_IDLE_TIMEOUT, 30)
 
+    def test_server_local_relay_capacity_defaults(self) -> None:
+        """Preview capacity defaults do not modify frozen protocol constants."""
+        server = srv.P2PServer()
+        self.assertEqual(server._relay_max_sessions_per_ip, 2)
+        self.assertEqual(server._relay_max_sessions, 500)
+        self.assertEqual(server._relay_bytes_per_second, 32768)
+        self.assertEqual(server._relay_burst_bytes, 512 * 1024)
+        self.assertEqual(srv.RELAY_BANDWIDTH_LIMIT, 256)
+
     def test_message_types_frozen(self) -> None:
         """消息类型名冻结"""
         self.assertEqual(srv.MSG_CREATE_ROOM, "CREATE_ROOM")
@@ -751,6 +920,56 @@ class TestProtocolCompliance(_ServerTestBase):
         if sys.platform == 'win32':
             policy = asyncio.get_event_loop_policy()
             self.assertIsInstance(policy, asyncio.WindowsSelectorEventLoopPolicy)
+
+
+class TestRelayCapacityConfig(unittest.TestCase):
+    """Server-local Relay capacity CLI and environment parsing."""
+
+    def test_cli_relay_capacity_args_parse(self) -> None:
+        argv = [
+            "server.py",
+            "--relay-max-sessions-per-ip", "4",
+            "--relay-max-sessions", "600",
+            "--relay-bytes-per-second", "2097152",
+            "--relay-burst-bytes", "1048576",
+        ]
+        with patch.object(sys, "argv", argv):
+            args = srv._parse_args()
+        self.assertEqual(args.relay_max_sessions_per_ip, 4)
+        self.assertEqual(args.relay_max_sessions, 600)
+        self.assertEqual(args.relay_bytes_per_second, 2097152)
+        self.assertEqual(args.relay_burst_bytes, 1048576)
+
+    def test_environment_relay_capacity_values_parse(self) -> None:
+        env = {
+            "S2PASS_RELAY_MAX_SESSIONS_PER_IP": "5",
+            "S2PASS_RELAY_MAX_SESSIONS": "700",
+            "S2PASS_RELAY_BYTES_PER_SECOND": "3145728",
+            "S2PASS_RELAY_BURST_BYTES": "1572864",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            server = srv.P2PServer()
+        self.assertEqual(server._relay_max_sessions_per_ip, 5)
+        self.assertEqual(server._relay_max_sessions, 700)
+        self.assertEqual(server._relay_bytes_per_second, 3145728)
+        self.assertEqual(server._relay_burst_bytes, 1572864)
+
+    def test_cli_values_override_environment(self) -> None:
+        env = {
+            "S2PASS_RELAY_BYTES_PER_SECOND": "100",
+            "S2PASS_RELAY_BURST_BYTES": "100",
+        }
+        with patch.dict(os.environ, env, clear=False):
+            server = srv.P2PServer(
+                relay_bytes_per_second=200,
+                relay_burst_bytes=300,
+            )
+        self.assertEqual(server._relay_bytes_per_second, 200)
+        self.assertEqual(server._relay_burst_bytes, 300)
+
+    def test_direct_capacity_values_must_remain_positive(self) -> None:
+        with self.assertRaises(ValueError):
+            srv.P2PServer(relay_burst_bytes=0)
 
 
 # ══════════════════════════════════════════════════════════════════════════════

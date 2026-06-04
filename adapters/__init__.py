@@ -3,6 +3,7 @@ from adapters.base import AdapterBase
 from adapters.launch_adapter import LaunchAdapter
 from adapters.udp_adapter import GenericUdpForwardAdapter
 from adapters.tcp_adapter import GenericTcpForwardAdapter
+from adapters.tcp_relay_adapter import TcpRelayAdapter
 from adapters.factory import create_adapter
 from adapters.transport import Transport, FakePairTransport, make_fake_pair
 from adapters.local_udp_bridge_adapter import LocalUdpBridgeAdapter
@@ -14,6 +15,7 @@ __all__ = [
     "LaunchAdapter",
     "GenericUdpForwardAdapter",
     "GenericTcpForwardAdapter",
+    "TcpRelayAdapter",
     "create_adapter",
     "Transport",
     "FakePairTransport",

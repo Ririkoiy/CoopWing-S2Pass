@@ -1,0 +1,7 @@
+{
+  "default_server_id": "ririko_vps",
+  "backend_api_port": 21520,
+  "log_level": "INFO",
+  "developer_mode": false,
+  "theme": "dark"
+}

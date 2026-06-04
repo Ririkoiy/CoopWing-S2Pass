@@ -177,9 +177,9 @@ _RE_PLAYER_NAME: re.Pattern = re.compile(r'^.{1,32}$', re.DOTALL)
 MAX_ROOMS:              int = 500           # 服务器最大房间数
 MAX_CONNECTIONS_PER_IP: int = 100           # 单 IP 最大并发 TCP 连接
 MAX_ROOMS_PER_IP:       int = 3             # 单 IP 最大活跃房间数
-TCP_RATE_LIMIT:         int = 10            # 条/秒/连接
-CREATE_ROOM_RATE:       int = 1             # 次/10秒/IP
-JOIN_ROOM_RATE:         int = 3             # 次/10秒/IP
+TCP_RATE_LIMIT:         int = 30            # 条/秒/连接
+CREATE_ROOM_RATE:       int = 3             # 次/10秒/IP
+JOIN_ROOM_RATE:         int = 6             # 次/10秒/IP
 UDP_RATE_LIMIT:         int = 2000          # 包/秒/IP
 RELAY_RATE_LIMIT:       int = 2000          # 包/秒/会话
 INVALID_PKT_THRESHOLD:  int = 50            # 包/分钟/IP
@@ -191,6 +191,11 @@ INVALID_TOKEN_LIMIT:    int = 10            # 次/分钟/IP
 WAITING_ROOM_TIMEOUT:   int = 300           # 5 分钟, WAITING 房间超时 (服务端策略)
 # ── 服务端本地超时配置 (非协议常量，本地预览/验证阶段可调整) ──
 _RELAY_IDLE_TIMEOUT_SECONDS: int = 1800  # Relay 空闲超时 (预览阶段, 协议规范值为 30)
+# Server-local preview capacity. Frozen protocol constants above remain unchanged.
+_RELAY_MAX_SESSIONS_PER_IP_DEFAULT: int = MAX_RELAY_PER_IP
+_RELAY_MAX_SESSIONS_DEFAULT: int = MAX_ROOMS
+_RELAY_BYTES_PER_SECOND_DEFAULT: int = (RELAY_BANDWIDTH_LIMIT * 1024) // 8
+_RELAY_BURST_BYTES_DEFAULT: int = 512 * 1024
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 日志配置 — 限流日志
@@ -202,6 +207,33 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S',
 )
 logger: logging.Logger = logging.getLogger("P2PServer")
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    """Read a positive integer environment variable, falling back safely."""
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    try:
+        value = int(raw_value)
+    except ValueError:
+        logger.warning("Invalid %s=%r; using default %d", name, raw_value, default)
+        return default
+    if value <= 0:
+        logger.warning("Invalid %s=%r; using default %d", name, raw_value, default)
+        return default
+    return value
+
+
+def _positive_int_arg(value: str) -> int:
+    """argparse type for positive integer capacity values."""
+    try:
+        parsed = int(value)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError("must be a positive integer") from exc
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("must be a positive integer")
+    return parsed
 
 
 class RateLimitedLogger:
@@ -288,8 +320,27 @@ class RelaySession:
     bytes_b:      int            = 0                     # 玩家 B 累计发送字节
     bandwidth_window_start: float = 0.0                  # 带宽窗口开始时间
     bandwidth_bytes:    int      = 0                     # 当前窗口字节数
+    bandwidth_tokens:   float    = 0.0                   # Server-local token bucket bytes
+    bandwidth_last_refill: float = 0.0                   # Token bucket refill time
     pkt_window_start:   float    = 0.0                   # 包速率窗口开始时间
     pkt_count:          int      = 0                     # 当前窗口包数
+    dropped_packets:    int      = 0                     # Server-side relay drop count
+    dropped_bytes:      int      = 0                     # Server-side relay dropped bytes
+    reserved_ips:       Tuple[str, ...] = field(default_factory=tuple)
+
+    # ── Server-local relay-path diagnostics (v0.2 live-debug) ──
+    relay_packets_received:    int = 0
+    relay_bytes_received:      int = 0
+    relay_packets_forwarded:   int = 0
+    relay_bytes_forwarded:     int = 0
+    relay_drop_missing_fields: int = 0
+    relay_drop_invalid_token:  int = 0
+    relay_drop_player_mismatch:    int = 0
+    relay_drop_no_target_udp_addr: int = 0
+    relay_drop_no_udp_transport:   int = 0
+    relay_drop_rate_limit_exceeded:    int = 0
+    relay_drop_bandwidth_exceeded:     int = 0
+    relay_forward_exceptions:          int = 0
 
 
 @dataclass
@@ -372,7 +423,10 @@ class IPRateLimiter:
                 return True
         return False
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        relay_max_sessions_per_ip: int = _RELAY_MAX_SESSIONS_PER_IP_DEFAULT,
+    ) -> None:
         # TCP 限流: 每连接消息速率
         self._tcp_buckets: Dict[str, TokenBucket] = {}
         # CREATE_ROOM 限流: 每 IP 1次/10秒
@@ -393,6 +447,7 @@ class IPRateLimiter:
         self._rooms_per_ip: Dict[str, int] = {}
         # 每 IP Relay 会话数
         self._relay_per_ip: Dict[str, int] = {}
+        self._relay_max_sessions_per_ip = relay_max_sessions_per_ip
 
     def is_banned(self, ip: str) -> bool:
         """检查 IP 是否被封禁"""
@@ -528,7 +583,7 @@ class IPRateLimiter:
         if self._is_whitelist(ip):
             return True
         count = self._relay_per_ip.get(ip, 0)
-        if count >= MAX_RELAY_PER_IP:
+        if count >= self._relay_max_sessions_per_ip:
             return False
         self._relay_per_ip[ip] = count + 1
         return True
@@ -591,7 +646,14 @@ class P2PServer:
     3. 房间生命周期: 状态机维护、超时管理、资源清理
     """
 
-    def __init__(self, advertise_host: Optional[str] = None) -> None:
+    def __init__(
+        self,
+        advertise_host: Optional[str] = None,
+        relay_max_sessions_per_ip: Optional[int] = None,
+        relay_max_sessions: Optional[int] = None,
+        relay_bytes_per_second: Optional[int] = None,
+        relay_burst_bytes: Optional[int] = None,
+    ) -> None:
         # ── 核心数据结构 ──
         self._rooms:   Dict[str, Room]   = {}    # room_id -> Room
         self._players: Dict[str, Player] = {}    # player_id -> Player
@@ -602,8 +664,50 @@ class P2PServer:
         # Relay Token -> RelaySession
         self._relay_sessions: Dict[str, RelaySession] = {}
 
+        # ── Server-local Relay capacity (CLI > environment > preview defaults) ──
+        self._relay_max_sessions_per_ip = (
+            relay_max_sessions_per_ip
+            if relay_max_sessions_per_ip is not None
+            else _env_positive_int(
+                'S2PASS_RELAY_MAX_SESSIONS_PER_IP',
+                _RELAY_MAX_SESSIONS_PER_IP_DEFAULT,
+            )
+        )
+        self._relay_max_sessions = (
+            relay_max_sessions
+            if relay_max_sessions is not None
+            else _env_positive_int(
+                'S2PASS_RELAY_MAX_SESSIONS',
+                _RELAY_MAX_SESSIONS_DEFAULT,
+            )
+        )
+        self._relay_bytes_per_second = (
+            relay_bytes_per_second
+            if relay_bytes_per_second is not None
+            else _env_positive_int(
+                'S2PASS_RELAY_BYTES_PER_SECOND',
+                _RELAY_BYTES_PER_SECOND_DEFAULT,
+            )
+        )
+        self._relay_burst_bytes = (
+            relay_burst_bytes
+            if relay_burst_bytes is not None
+            else _env_positive_int(
+                'S2PASS_RELAY_BURST_BYTES',
+                _RELAY_BURST_BYTES_DEFAULT,
+            )
+        )
+        for capacity_name, capacity_value in (
+            ('relay_max_sessions_per_ip', self._relay_max_sessions_per_ip),
+            ('relay_max_sessions', self._relay_max_sessions),
+            ('relay_bytes_per_second', self._relay_bytes_per_second),
+            ('relay_burst_bytes', self._relay_burst_bytes),
+        ):
+            if capacity_value <= 0:
+                raise ValueError(f"{capacity_name} must be positive")
+
         # ── 限流 ──
-        self._rate_limiter = IPRateLimiter()
+        self._rate_limiter = IPRateLimiter(self._relay_max_sessions_per_ip)
 
         # ── 服务器基础设施 ──
         self._tcp_server: Optional[asyncio.AbstractServer] = None
@@ -677,6 +781,10 @@ class P2PServer:
         logger.info("  UDP Relay端口:   %d", UDP_PORT)
         logger.info("  advertise_host:  %s", self._public_ip)
         logger.info("  relay_port:      %d", UDP_PORT)
+        logger.info("  relay_max_sessions_per_ip: %d", self._relay_max_sessions_per_ip)
+        logger.info("  relay_max_sessions:        %d", self._relay_max_sessions)
+        logger.info("  relay_bytes_per_second:    %d", self._relay_bytes_per_second)
+        logger.info("  relay_burst_bytes:         %d", self._relay_burst_bytes)
 
     async def stop(self) -> None:
         """优雅关闭服务器 — 清理所有资源"""
@@ -1278,24 +1386,37 @@ class P2PServer:
             await self._close_room(room.room_id, reason="Player missing")
             return
 
-        # ── IP Relay 限制检查 ──
-        creator_ip = creator.tcp_ip or ""
-        joiner_ip = joiner.tcp_ip or ""
-
-        can_relay_creator = self._rate_limiter.add_relay(creator_ip)
-        if not can_relay_creator:
-            logger.warning("IP %s Relay 会话数超限", creator_ip)
-            # 向双方发送 RELAY_UNAVAILABLE
+        # ── Relay capacity checks ──
+        if len(self._relay_sessions) >= self._relay_max_sessions:
+            logger.warning(
+                "房间 %s 切换 RELAY 失败: 全局 Relay 会话数超限 "
+                "(active=%d limit=%d)",
+                room.room_id,
+                len(self._relay_sessions),
+                self._relay_max_sessions,
+            )
             if creator.tcp_writer:
                 await self._send_error(creator.tcp_writer, ErrorCode.RELAY_UNAVAILABLE)
             if joiner.tcp_writer:
                 await self._send_error(joiner.tcp_writer, ErrorCode.RELAY_UNAVAILABLE)
             return
 
-        can_relay_joiner = self._rate_limiter.add_relay(joiner_ip)
-        if not can_relay_joiner:
-            self._rate_limiter.remove_relay(creator_ip)
-            logger.warning("IP %s Relay 会话数超限", joiner_ip)
+        creator_ip = creator.tcp_ip or ""
+        joiner_ip = joiner.tcp_ip or ""
+        relay_ips = tuple(dict.fromkeys((creator_ip, joiner_ip)))
+        reserved_ips: list[str] = []
+        for relay_ip in relay_ips:
+            if self._rate_limiter.add_relay(relay_ip):
+                reserved_ips.append(relay_ip)
+                continue
+            for reserved_ip in reserved_ips:
+                self._rate_limiter.remove_relay(reserved_ip)
+            logger.warning(
+                "房间 %s 切换 RELAY 失败: IP %s Relay 会话数超限 (limit=%d)",
+                room.room_id,
+                relay_ip,
+                self._relay_max_sessions_per_ip,
+            )
             if creator.tcp_writer:
                 await self._send_error(creator.tcp_writer, ErrorCode.RELAY_UNAVAILABLE)
             if joiner.tcp_writer:
@@ -1314,6 +1435,9 @@ class P2PServer:
             created_at=now,
             last_activity=now,
             bandwidth_window_start=now,
+            bandwidth_tokens=float(self._relay_burst_bytes),
+            bandwidth_last_refill=now,
+            reserved_ips=tuple(reserved_ips),
         )
 
         room.relay_session = relay_session
@@ -1372,6 +1496,11 @@ class P2PServer:
         player_id = header.get("player_id")
 
         if not isinstance(relay_token, str) or not isinstance(player_id, str):
+            # Session is unknown at this point; log via rate limiter for visibility
+            rl_logger.warning(
+                "relay_missing_fields",
+                "Relay packet missing relay_token or player_id from %s", ip,
+            )
             return
 
         # ── 验证 Token ──
@@ -1381,16 +1510,22 @@ class P2PServer:
                 self._rate_limiter.ban_ip(ip, IP_BAN_DURATION_TOKEN)
             return
 
+        # ── Session-level diagnostics: received ──
+        session.relay_packets_received += 1
+        session.relay_bytes_received += len(data_bytes)
+
         # ── 确定转发目标 ──
         if player_id == session.player_a_id:
             target_id = session.player_b_id
         elif player_id == session.player_b_id:
             target_id = session.player_a_id
         else:
+            session.relay_drop_player_mismatch += 1
             return
 
         target_player = self._players.get(target_id)
         if target_player is None or target_player.udp_addr is None:
+            session.relay_drop_no_target_udp_addr += 1
             return
 
         # ── 包速率限制检查 (60 pkt/s/session) ──
@@ -1405,29 +1540,52 @@ class P2PServer:
 
             session.pkt_count += 1
             if session.pkt_count > RELAY_RATE_LIMIT:
+                session.dropped_packets += 1
+                session.relay_drop_rate_limit_exceeded += 1
                 rl_logger.warning(
                     f"relay_pkt_{session.relay_token}",
-                    "Relay 包速率超限 (token: %s)", session.relay_token,
+                    "Relay 包速率超限, 丢弃 payload "
+                    "(token=%s packet_limit=%d dropped_packets=%d)",
+                    session.relay_token,
+                    RELAY_RATE_LIMIT,
+                    session.dropped_packets,
                 )
                 return
 
-        # ── 带宽限制检查 (256 Kbps/session) ──
+        # ── Server-local token bucket bandwidth limit ──
         game_data_len = len(data_bytes) - newline_pos - 1
 
         if not is_whitelisted:
-            if now - session.bandwidth_window_start >= 1.0:
-                session.bandwidth_window_start = now
-                session.bandwidth_bytes = 0
-
-            # 256 Kbps = 32 KB/s = 32768 B/s
-            bandwidth_limit_bytes = (RELAY_BANDWIDTH_LIMIT * 1024) // 8
-            if session.bandwidth_bytes + game_data_len > bandwidth_limit_bytes:
+            elapsed = max(0.0, now - session.bandwidth_last_refill)
+            session.bandwidth_tokens = min(
+                float(self._relay_burst_bytes),
+                session.bandwidth_tokens + elapsed * self._relay_bytes_per_second,
+            )
+            session.bandwidth_last_refill = now
+            if game_data_len > session.bandwidth_tokens:
+                session.dropped_packets += 1
+                session.dropped_bytes += game_data_len
+                session.relay_drop_bandwidth_exceeded += 1
                 rl_logger.warning(
                     f"relay_bw_{session.relay_token}",
-                    "Relay 带宽超限 (token: %s)", session.relay_token,
+                    "Relay 带宽超限, 丢弃 payload "
+                    "(token=%s payload_bytes=%d available_bytes=%d "
+                    "bytes_per_second=%d burst_bytes=%d "
+                    "dropped_packets=%d dropped_bytes=%d)",
+                    session.relay_token,
+                    game_data_len,
+                    int(session.bandwidth_tokens),
+                    self._relay_bytes_per_second,
+                    self._relay_burst_bytes,
+                    session.dropped_packets,
+                    session.dropped_bytes,
                 )
                 return
+            session.bandwidth_tokens -= game_data_len
 
+        if now - session.bandwidth_window_start >= 1.0:
+            session.bandwidth_window_start = now
+            session.bandwidth_bytes = 0
         session.bandwidth_bytes += game_data_len
         session.last_activity = now
 
@@ -1441,7 +1599,14 @@ class P2PServer:
                 separators=(',', ':'),
             ).encode('utf-8')
             forward_data = b"RELAY\n" + forward_header + b"\n" + data_bytes[newline_pos + 1:]
-            self._udp_transport.sendto(forward_data, target_player.udp_addr)
+            try:
+                self._udp_transport.sendto(forward_data, target_player.udp_addr)
+                session.relay_packets_forwarded += 1
+                session.relay_bytes_forwarded += len(forward_data)
+            except OSError:
+                session.relay_forward_exceptions += 1
+        else:
+            session.relay_drop_no_udp_transport += 1
 
     # ══════════════════════════════════════════════════════════════════════
     # 房间关闭与资源清理
@@ -1486,13 +1651,19 @@ class P2PServer:
             token = room.relay_session.relay_token
             self._relay_sessions.pop(token, None)
 
-            # 归还 Relay 计数（需在移除玩家之前读取 IP）
-            for pid in (room.creator_id, room.joiner_id):
-                if pid is None:
-                    continue
-                p = self._players.get(pid)
-                if p is not None and p.tcp_ip:
-                    self._rate_limiter.remove_relay(p.tcp_ip)
+            # Return each per-IP session reservation exactly once.
+            reserved_ips = room.relay_session.reserved_ips
+            if not reserved_ips:
+                fallback_ips: list[str] = []
+                for pid in (room.creator_id, room.joiner_id):
+                    if pid is None:
+                        continue
+                    p = self._players.get(pid)
+                    if p is not None and p.tcp_ip:
+                        fallback_ips.append(p.tcp_ip)
+                reserved_ips = tuple(dict.fromkeys(fallback_ips))
+            for relay_ip in reserved_ips:
+                self._rate_limiter.remove_relay(relay_ip)
 
             room.relay_session = None
 
@@ -1828,13 +1999,47 @@ def _parse_args() -> argparse.Namespace:
              '优先级: --advertise-host > S2PASS_ADVERTISE_HOST 环境变量 > 默认值 127.0.0.1。'
              '示例: --advertise-host 120.27.210.184',
     )
+    parser.add_argument(
+        '--relay-max-sessions-per-ip',
+        type=_positive_int_arg,
+        default=None,
+        help='Per-IP active Relay session limit '
+             '(CLI > S2PASS_RELAY_MAX_SESSIONS_PER_IP > default 2).',
+    )
+    parser.add_argument(
+        '--relay-max-sessions',
+        type=_positive_int_arg,
+        default=None,
+        help='Global active Relay session limit '
+             '(CLI > S2PASS_RELAY_MAX_SESSIONS > default 500).',
+    )
+    parser.add_argument(
+        '--relay-bytes-per-second',
+        type=_positive_int_arg,
+        default=None,
+        help='Server-local per-session Relay sustained byte rate '
+             '(CLI > S2PASS_RELAY_BYTES_PER_SECOND > default 32768).',
+    )
+    parser.add_argument(
+        '--relay-burst-bytes',
+        type=_positive_int_arg,
+        default=None,
+        help='Server-local per-session Relay token bucket burst '
+             '(CLI > S2PASS_RELAY_BURST_BYTES > default 524288).',
+    )
     return parser.parse_args()
 
 
 async def _main() -> None:
     """异步主入口"""
     args = _parse_args()
-    server = P2PServer(advertise_host=args.advertise_host)
+    server = P2PServer(
+        advertise_host=args.advertise_host,
+        relay_max_sessions_per_ip=args.relay_max_sessions_per_ip,
+        relay_max_sessions=args.relay_max_sessions,
+        relay_bytes_per_second=args.relay_bytes_per_second,
+        relay_burst_bytes=args.relay_burst_bytes,
+    )
 
     # ── 注册信号处理 (优雅关闭) ──
     loop = asyncio.get_running_loop()

@@ -1,0 +1,9 @@
+[
+  {
+    "server_id": "ririko_vps",
+    "display_name": "Default VPS",
+    "host": "120.27.210.184",
+    "description": "Default Preview relay/signaling server",
+    "enabled": true
+  }
+]

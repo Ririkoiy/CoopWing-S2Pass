@@ -229,14 +229,14 @@ python -m unittest discover
 进入 Flutter mock 目录：
 
 ```powershell
-cd coopwing_client
+cd s2pass_flutter_mock
 flutter test
 ```
 
 ### Flutter Windows 构建
 
 ```powershell
-cd coopwing_client
+cd s2pass_flutter_mock
 flutter build windows
 ```
 
@@ -559,14 +559,14 @@ Some smoke tools may require opening local ports or starting subprocesses.
 Run from the Flutter mock directory:
 
 ```powershell
-cd coopwing_client
+cd s2pass_flutter_mock
 flutter test
 ```
 
 ### Flutter Windows Build
 
 ```powershell
-cd coopwing_client
+cd s2pass_flutter_mock
 flutter build windows
 ```
 

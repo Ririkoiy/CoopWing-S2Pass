@@ -414,6 +414,12 @@ void main() {
     await tester.pumpWidget(_bridgeTestApp(client));
     await tester.pumpAndSettle();
 
+    await _enterPlayerName(tester);
+    await tester.tap(find.text('Join Room'));
+    await tester.pumpAndSettle();
+    await tester.enterText(find.widgetWithText(TextField, 'Room ID'), 'MOCK42');
+    await tester.pump();
+
     await tester.ensureVisible(find.text('Advanced Backend Settings'));
     await tester.tap(find.text('Advanced Backend Settings'));
     await tester.pumpAndSettle();
@@ -466,6 +472,83 @@ void main() {
     expect(config.targetPort, 27015);
   });
 
+  testWidgets('Create request uses TCP Relay adapter mode', (tester) async {
+    final client = _CapturingMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await tester.ensureVisible(find.text('Advanced Backend Settings'));
+    await tester.tap(find.text('Advanced Backend Settings'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('UDP Experimental'));
+    await tester.tap(find.text('UDP Experimental').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('TCP Relay Experimental').last);
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await _enterGameServerPort(tester, '25565');
+    await tester.ensureVisible(
+      find.widgetWithText(FilledButton, 'Create Room'),
+    );
+    tester
+        .widget<FilledButton>(find.widgetWithText(FilledButton, 'Create Room'))
+        .onPressed
+        ?.call();
+    await tester.pumpAndSettle();
+
+    final config = client.lastCreateAdapterConfig!;
+    expect(config.enabled, isTrue);
+    expect(config.adapterType, 'tcp_relay');
+    expect(config.bindHost, '127.0.0.1');
+    expect(config.bindPort, 0);
+    expect(config.targetHost, '127.0.0.1');
+    expect(config.targetPort, 25565);
+    expect(config.targetPort, isNot(25566));
+    expect(
+      find.textContaining('Forwards TCP traffic through the room/Relay'),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('Create request keeps Local TCP Forward as local adapter mode', (
+    tester,
+  ) async {
+    final client = _CapturingMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await tester.ensureVisible(find.text('Advanced Backend Settings'));
+    await tester.tap(find.text('Advanced Backend Settings'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('UDP Experimental'));
+    await tester.tap(find.text('UDP Experimental').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Local TCP Forward').last);
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await _enterGameServerPort(tester, '25565');
+    await tester.ensureVisible(
+      find.widgetWithText(FilledButton, 'Create Room'),
+    );
+    tester
+        .widget<FilledButton>(find.widgetWithText(FilledButton, 'Create Room'))
+        .onPressed
+        ?.call();
+    await tester.pumpAndSettle();
+
+    final config = client.lastCreateAdapterConfig!;
+    expect(config.enabled, isTrue);
+    expect(config.adapterType, 'tcp_forward');
+    expect(config.bindPort, 0);
+    expect(config.targetPort, 25565);
+  });
+
   testWidgets('Force Relay is visible and enabled by default', (tester) async {
     final client = _CapturingMockClient();
     addTearDown(client.dispose);
@@ -507,7 +590,8 @@ void main() {
     await tester.pumpAndSettle();
 
     await _enterPlayerName(tester);
-    await tester.tap(find.text('Join Room'));
+    await tester.ensureVisible(find.text('Join Room').first);
+    await tester.tap(find.text('Join Room').first);
     await tester.pumpAndSettle();
     await tester.enterText(find.widgetWithText(TextField, 'Room ID'), 'MOCK42');
     await tester.pump();
@@ -524,6 +608,42 @@ void main() {
     final config = client.lastJoinAdapterConfig!;
     expect(config.enabled, isTrue);
     expect(config.adapterType, 'local_udp_bridge');
+    expect(config.bindHost, '127.0.0.1');
+    expect(config.bindPort, 0);
+    expect(config.targetHost, '127.0.0.1');
+    expect(config.targetPort, isNull);
+  });
+
+  testWidgets('Join request uses TCP Relay without target port', (
+    tester,
+  ) async {
+    final client = _CapturingMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client, initialMode: 'join'));
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await tester.enterText(find.widgetWithText(TextField, 'Room ID'), 'MOCK42');
+    await tester.pump();
+
+    await tester.ensureVisible(find.text('Advanced Backend Settings'));
+    await tester.tap(find.text('Advanced Backend Settings'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('UDP Experimental'));
+    await tester.tap(find.text('UDP Experimental').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('TCP Relay Experimental').last);
+    await tester.pumpAndSettle();
+
+    tester
+        .widget<FilledButton>(find.widgetWithText(FilledButton, 'Join Room'))
+        .onPressed
+        ?.call();
+    await tester.pumpAndSettle();
+
+    final config = client.lastJoinAdapterConfig!;
+    expect(config.adapterType, 'tcp_relay');
     expect(config.bindHost, '127.0.0.1');
     expect(config.bindPort, 0);
     expect(config.targetHost, '127.0.0.1');
@@ -597,8 +717,30 @@ void main() {
         enabled: true,
         status: 'stopped',
         adapterType: 'local_udp_bridge',
+        bindHost: '127.0.0.1',
+        bindPort: 0,
       ),
       ['Adapter', 'Stopped / configured but not running'],
+    );
+
+    await _expectAdapterDisplay(
+      tester,
+      const AdapterStatus(
+        enabled: true,
+        status: 'ready',
+        adapterType: 'tcp_relay',
+        bindHost: '127.0.0.1',
+        bindPort: 0,
+        targetHost: '127.0.0.1',
+        targetPort: 25565,
+        counters: AdapterCounters(
+          packetsFromGame: 0,
+          packetsToTransport: 0,
+          packetsFromTransport: 0,
+          packetsToGame: 0,
+        ),
+      ),
+      ['Adapter', 'Ready', 'Game server address', '127.0.0.1:25565'],
     );
 
     await _expectAdapterDisplay(
@@ -793,7 +935,7 @@ void main() {
   });
 }
 
-Widget _bridgeTestApp(MockBackendClient client) {
+Widget _bridgeTestApp(MockBackendClient client, {String? initialMode}) {
   return ListenableBuilder(
     listenable: Localization(),
     builder: (context, _) {
@@ -803,6 +945,7 @@ Widget _bridgeTestApp(MockBackendClient client) {
             child: BackendBridgePanel(
               client: client,
               onRunDiagnostics: _testReport,
+              initialMode: initialMode,
             ),
           ),
         ),

@@ -10,18 +10,29 @@ import secrets
 import threading
 import time
 import os
+import dataclasses
 from typing import Any, Callable, Dict, List, Optional, Protocol
 
 from backend.adapter_manager import AdapterManager
 from backend.models import (
     ADAPTER_STATUS_ERROR,
     ADAPTER_STATUS_READY,
+    ADAPTER_TYPE_BUNDLE,
+    ADAPTER_TYPE_TCP_FORWARD,
     AdapterConfig,
     AdapterStatus,
     BackendError,
+    ParticipantDto,
     SessionEvent,
     SessionInfo,
     SessionStats,
+)
+from adapters.transport import make_fake_pair
+from secondary_ip_manager import (
+    FALLBACK_BIND_HOST,
+    InMemoryLeaseStore,
+    SecondaryIpManager,
+    SecondaryIpSystem,
 )
 
 RUNNER_MODE_ENV = "S2PASS_BACKEND_RUNNER"
@@ -34,6 +45,8 @@ _EVENT_STATUS: Dict[str, str] = {
     "session_starting": "starting",
     "room_created": "room_created",
     "room_joined": "room_joined",
+    "room_ready": "room_ready",
+    "room_closed": "closed",
     "relay_ready": "relay_ready",
     "session_running": "running",
     "session_stopping": "stopping",
@@ -90,6 +103,19 @@ class FakeSessionRunner:
         emit("session_stopped", "Session stopped", {"session_id": info.session_id})
 
 
+class _NoopSecondaryIpSystem(SecondaryIpSystem):
+    """Default backend system boundary: never mutates machine IP settings."""
+
+    def has_ip_mutation_permission(self) -> bool:
+        return False
+
+    def list_interfaces(self):
+        return []
+
+    def list_interface_ipv4(self, interface_index: int):
+        return []
+
+
 def resolve_runner_mode(runner_mode: Optional[str] = None) -> str:
     """Resolve and validate the backend runner mode."""
     raw = runner_mode
@@ -133,12 +159,20 @@ class SessionManager:
         runner_factory: Optional[Callable[[], SessionRunner]] = None,
         runner_mode: Optional[str] = None,
         create_confirm_timeout: float = _CREATE_CONFIRM_TIMEOUT_SECONDS,
+        secondary_ip_manager: Optional[SecondaryIpManager] = None,
+        adapter_manager: Optional[AdapterManager] = None,
     ) -> None:
+        self.runner_mode = resolve_runner_mode(runner_mode)
         self._sessions: Dict[str, SessionInfo] = {}
         self._logs: Dict[str, List[SessionEvent]] = {}
         self._runners: Dict[str, SessionRunner] = {}
-        self._adapter_manager = AdapterManager()
-        self.runner_mode = resolve_runner_mode(runner_mode)
+        self._adapter_manager = adapter_manager or AdapterManager(
+            bundle_transport_factory=(
+                self._make_fake_bundle_transport
+                if self.runner_mode == RUNNER_MODE_FAKE
+                else None
+            ),
+        )
         self._custom_runner_factory = runner_factory
         self._runner_factory = runner_factory or make_runner_factory(self.runner_mode)
         self._lock = threading.Lock()
@@ -146,6 +180,10 @@ class SessionManager:
         self._fake_port_lock = threading.Lock()
         self._create_confirm_timeout = max(0.0, float(create_confirm_timeout))
         self._create_confirm_events: Dict[str, threading.Event] = {}
+        self._secondary_ip_manager = secondary_ip_manager or SecondaryIpManager(
+            _NoopSecondaryIpSystem(),
+            InMemoryLeaseStore(),
+        )
 
     def _allocate_fake_port(self) -> int:
         """Return next unique fake adapter port (thread-safe)."""
@@ -167,6 +205,10 @@ class SessionManager:
         force_relay = _request_bool(request, "force_relay", default=True)
         bind_port = _require_port_or_zero(request, "bind_port", default=0)
         adapter_config = _parse_adapter_config(request)
+        adapter_config, secondary_ip_state = self._resolve_secondary_ip_adapter_config(
+            adapter_config,
+        )
+        _validate_forward_adapter_target(adapter_config)
         _validate_create_adapter_target(adapter_config, game_server_port)
 
         session_id = _generate_session_id()
@@ -192,6 +234,14 @@ class SessionManager:
             updated_at=now,
             stats=SessionStats(),
             adapter_config=adapter_config,
+            secondary_ip_enabled=secondary_ip_state["enabled"],
+            secondary_ip_fallback_used=secondary_ip_state["fallback_used"],
+            secondary_ip_warning=secondary_ip_state["warning"],
+            backend_admin=secondary_ip_state["backend_admin"],
+            secondary_ip_bind_address=secondary_ip_state["bind_address"],
+            secondary_ip_interface_index=secondary_ip_state["interface_index"],
+            secondary_ip_interface_alias=secondary_ip_state["interface_alias"],
+            adapter_bind_mode=secondary_ip_state["bind_mode"],
         )
         info.adapter_status = self._adapter_manager.configure(session_id, adapter_config)
 
@@ -231,6 +281,10 @@ class SessionManager:
         game_server_port = _optional_request_port(request, "game_server_port")
         force_relay = _request_bool(request, "force_relay", default=True)
         adapter_config = _parse_adapter_config(request)
+        adapter_config, secondary_ip_state = self._resolve_secondary_ip_adapter_config(
+            adapter_config,
+        )
+        _validate_forward_adapter_target(adapter_config)
 
         session_id = _generate_session_id()
         now = time.time()
@@ -253,6 +307,14 @@ class SessionManager:
             updated_at=now,
             stats=SessionStats(),
             adapter_config=adapter_config,
+            secondary_ip_enabled=secondary_ip_state["enabled"],
+            secondary_ip_fallback_used=secondary_ip_state["fallback_used"],
+            secondary_ip_warning=secondary_ip_state["warning"],
+            backend_admin=secondary_ip_state["backend_admin"],
+            secondary_ip_bind_address=secondary_ip_state["bind_address"],
+            secondary_ip_interface_index=secondary_ip_state["interface_index"],
+            secondary_ip_interface_alias=secondary_ip_state["interface_alias"],
+            adapter_bind_mode=secondary_ip_state["bind_mode"],
         )
         info.adapter_status = self._adapter_manager.configure(session_id, adapter_config)
 
@@ -303,6 +365,113 @@ class SessionManager:
             if adapter_status is not None:
                 info.adapter_status = adapter_status
         return sessions
+
+    def backend_has_ip_mutation_permission(self) -> bool:
+        checker = getattr(
+            self._secondary_ip_manager,
+            "has_ip_mutation_permission",
+            None,
+        )
+        if checker is None:
+            return False
+        return bool(checker())
+
+    def secondary_ip_recommendation(self) -> Dict[str, Any]:
+        recommender = getattr(
+            self._secondary_ip_manager,
+            "recommend_secondary_ip",
+            None,
+        )
+        if not callable(recommender):
+            return {
+                "available": False,
+                "backend_admin": self.backend_has_ip_mutation_permission(),
+                "interface_index": None,
+                "interface_alias": None,
+                "interface_description": None,
+                "interface_ip": None,
+                "prefix_length": None,
+                "recommended_ip": None,
+                "reason": "not_supported",
+                "warning": "secondary IP recommendation is not supported",
+            }
+        try:
+            recommendation = recommender()
+        except Exception as exc:
+            return {
+                "available": False,
+                "backend_admin": self.backend_has_ip_mutation_permission(),
+                "interface_index": None,
+                "interface_alias": None,
+                "interface_description": None,
+                "interface_ip": None,
+                "prefix_length": None,
+                "recommended_ip": None,
+                "reason": "recommendation_failed",
+                "warning": str(exc),
+            }
+        to_dict = getattr(recommendation, "to_dict", None)
+        if callable(to_dict):
+            return dict(to_dict())
+        return dict(recommendation)
+
+    # ------------------------------------------------------------------
+    # secondary IP lifecycle
+    # ------------------------------------------------------------------
+
+    def startup_auto_allocate_secondary_ip(self) -> Dict[str, Any]:
+        """Clean stale leases and attempt safe auto-allocation.
+
+        Safe to call even when not admin — returns status with
+        ``allocated=False`` in that case.
+        """
+        try:
+            cleanup = self._secondary_ip_manager.startup_cleanup_stale_leases()
+        except Exception:
+            cleanup = None
+        status = self._secondary_ip_manager.auto_allocate_on_admin_startup()
+        result = status.to_dict()
+        if cleanup is not None:
+            result["startup_cleanup"] = {
+                "ok": cleanup.ok,
+                "items": [
+                    {
+                        "interface_index": item.lease.interface_index,
+                        "ip_address": item.lease.ip_address,
+                        "status": item.status,
+                        "error": item.error,
+                    }
+                    for item in cleanup.items
+                ],
+            }
+        return result
+
+    def release_secondary_ip(self) -> Dict[str, Any]:
+        """Release the secondary IP allocated during this session."""
+        result = self._secondary_ip_manager.release_allocated_secondary_ip()
+        return {
+            "ok": result.ok,
+            "items": [
+                {
+                    "interface_index": item.lease.interface_index,
+                    "ip_address": item.lease.ip_address,
+                    "status": item.status,
+                    "error": item.error,
+                }
+                for item in result.items
+            ],
+        }
+
+    def secondary_ip_status(self) -> Dict[str, Any]:
+        """Return the current secondary IP state snapshot."""
+        return self._secondary_ip_manager.get_secondary_ip_status().to_dict()
+
+    def shutdown_secondary_ip(self) -> Dict[str, Any]:
+        """Release secondary IP on shutdown. Best-effort, never raises."""
+        try:
+            return self.release_secondary_ip()
+        except Exception:
+            return {"ok": False, "items": [], "warning": "shutdown release failed"}
 
     def stop_session(self, session_id: str) -> SessionInfo:
         info = self.get_session(session_id)
@@ -383,6 +552,15 @@ class SessionManager:
                     details={"session_id": session_id},
                 )
             if info.status == "failed":
+                error = info.error if isinstance(info.error, dict) else {}
+                code = error.get("code")
+                message = error.get("message")
+                if isinstance(code, str) and isinstance(message, str):
+                    raise BackendError(
+                        code=code,
+                        message=message,
+                        details={"session_id": session_id},
+                    )
                 raise BackendError(
                     code="SESSION_START_FAILED",
                     message="Session failed before room_id was confirmed",
@@ -397,6 +575,60 @@ class SessionManager:
         finally:
             with self._lock:
                 self._create_confirm_events.pop(session_id, None)
+
+    def _resolve_secondary_ip_adapter_config(
+        self,
+        adapter_config: Optional[AdapterConfig],
+    ) -> tuple[Optional[AdapterConfig], Dict[str, Any]]:
+        state: Dict[str, Any] = {
+            "enabled": False,
+            "fallback_used": False,
+            "warning": None,
+            "backend_admin": self.backend_has_ip_mutation_permission(),
+            "bind_address": None,
+            "interface_index": None,
+            "interface_alias": None,
+            "bind_mode": "loopback",
+        }
+        if (
+            adapter_config is None
+            or not adapter_config.enabled
+            or adapter_config.secondary_ip_request is None
+        ):
+            return adapter_config, state
+
+        request = adapter_config.secondary_ip_request
+        decision = self._secondary_ip_manager.choose_adapter_bind_host(
+            request.ip_address,
+            default_bind_host=adapter_config.bind_host,
+            interface_hint=request.interface_hint,
+            prefix_length=request.prefix_length,
+        )
+        fallback_used = bool(getattr(decision, "fallback_used", False))
+        enabled = bool(
+            getattr(
+                decision,
+                "secondary_ip_enabled",
+                decision.bind_host != FALLBACK_BIND_HOST and not fallback_used,
+            )
+        )
+        warning = getattr(decision, "warning", None)
+        state = {
+            "enabled": enabled,
+            "fallback_used": fallback_used,
+            "warning": warning,
+            "backend_admin": bool(getattr(decision, "backend_admin", False)),
+            "bind_address": decision.bind_host if enabled else None,
+            "interface_index": getattr(decision, "target_interface_index", None),
+            "interface_alias": getattr(decision, "target_interface_alias", None),
+            "bind_mode": getattr(decision, "bind_mode", "loopback"),
+        }
+        return dataclasses.replace(
+            adapter_config,
+            bind_host=decision.bind_host,
+            secondary_ip_enabled=enabled,
+            secondary_ip_warning=warning,
+        ), state
 
     def _stop_adapter_if_ready(self, session_id: str, info: SessionInfo) -> None:
         prior_adapter_status = self._adapter_manager.snapshot(session_id)
@@ -443,6 +675,7 @@ class SessionManager:
             status = _EVENT_STATUS.get(event_type)
             if status is not None:
                 info.status = status
+            self._apply_runner_event(info, event_type, data)
             info.updated_at = now
             self._logs.setdefault(session_id, []).append(SessionEvent(
                 type=event_type,
@@ -484,7 +717,12 @@ class SessionManager:
             self._emit_event(
                 session_id,
                 "adapter_ready",
-                "Adapter ready",
+                (
+                    "Adapter ready; Bundle includes UDP Broadcast/LAN "
+                    "Discovery forwarding"
+                    if status.adapter_type == ADAPTER_TYPE_BUNDLE
+                    else "Adapter ready"
+                ),
                 _adapter_status_event_data(status),
             )
         elif status.status == ADAPTER_STATUS_ERROR:
@@ -494,11 +732,116 @@ class SessionManager:
                 "Adapter error",
                 _adapter_status_event_data(status),
             )
+            if status.adapter_type == ADAPTER_TYPE_BUNDLE:
+                error = status.error or {}
+                self._emit_event(
+                    session_id,
+                    "session_failed",
+                    error.get("message", "Bundle failed to start"),
+                    {
+                        "session_id": session_id,
+                        "code": error.get("code", "BUNDLE_START_FAILED"),
+                        "message": error.get(
+                            "message",
+                            "Bundle failed to start",
+                        ),
+                    },
+                )
+
+    def _apply_runner_event(
+        self,
+        info: SessionInfo,
+        event_type: str,
+        data: Optional[Dict[str, Any]],
+    ) -> None:
+        if not isinstance(data, dict):
+            return
+
+        if event_type == "session_failed":
+            code = data.get("code")
+            message = data.get("message")
+            if isinstance(code, str) and isinstance(message, str):
+                info.error = {"code": code, "message": message}
+
+        if isinstance(data.get("player_id"), str):
+            info.player_id = data["player_id"]
+        if isinstance(data.get("protocol_version"), int):
+            info.protocol_version = data["protocol_version"]
+        elif event_type == "room_updated" and info.protocol_version is None:
+            info.protocol_version = 2
+        if isinstance(data.get("max_players"), int):
+            info.max_players = data["max_players"]
+        if isinstance(data.get("host_player_id"), str):
+            info.host_player_id = data["host_player_id"]
+        if isinstance(data.get("server_time"), (int, float)):
+            info.server_time = float(data["server_time"])
+
+        if "participants" in data:
+            info.participants = _participant_dtos(data.get("participants"))
+            if isinstance(data.get("participant_count"), int):
+                info.participant_count = data["participant_count"]
+            else:
+                info.participant_count = len(info.participants)
+            if info.host_player_id is None:
+                for participant in info.participants:
+                    if participant.is_host:
+                        info.host_player_id = participant.player_id
+                        break
+        elif isinstance(data.get("participant_count"), int):
+            info.participant_count = data["participant_count"]
+
+        room_event = data.get("event")
+        if isinstance(room_event, str):
+            info.last_room_event = room_event
+        elif event_type in {
+            "room_updated",
+            "participant_joined",
+            "participant_left",
+            "room_ready",
+            "room_closed",
+        }:
+            info.last_room_event = event_type
+
+        if event_type == "room_ready" or room_event == "room_ready":
+            info.room_ready = True
+        if event_type == "room_closed" or room_event == "room_closed":
+            info.room_closed = True
+        if event_type == "relay_ready":
+            info.relay_ready = True
+            if isinstance(data.get("relay_token_available"), bool):
+                info.relay_token_available = data["relay_token_available"]
+            elif data.get("relay_token"):
+                info.relay_token_available = True
+            if isinstance(data.get("relay_target_host"), str):
+                info.relay_target_host = data["relay_target_host"]
+            if isinstance(data.get("relay_target_port"), int):
+                info.relay_target_port = data["relay_target_port"]
+
+    @staticmethod
+    def _make_fake_bundle_transport(
+        session_id: str,
+        config: AdapterConfig,
+    ) -> Any:
+        local, _ = make_fake_pair()
+        return local
 
 
 # ------------------------------------------------------------------
 # helpers
 # ------------------------------------------------------------------
+
+def _participant_dtos(raw: Any) -> List[ParticipantDto]:
+    if not isinstance(raw, list):
+        return []
+    participants: List[ParticipantDto] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            continue
+        if not isinstance(item.get("player_id"), str):
+            continue
+        participants.append(ParticipantDto.from_dict(item))
+    return participants
+
 
 def _require_str(request: Dict[str, Any], key: str) -> str:
     value = request.get(key)
@@ -601,6 +944,31 @@ def _validate_create_adapter_target(
                 "game_server_port": game_server_port,
                 "target_port": adapter_config.target_port,
             },
+        )
+
+
+def _validate_forward_adapter_target(
+    adapter_config: Optional[AdapterConfig],
+) -> None:
+    if (
+        adapter_config is None
+        or not adapter_config.enabled
+        or adapter_config.adapter_type not in {
+            ADAPTER_TYPE_BUNDLE,
+            ADAPTER_TYPE_TCP_FORWARD,
+        }
+    ):
+        return
+    if adapter_config.target_port is None:
+        mode_name = (
+            "Bundle"
+            if adapter_config.adapter_type == ADAPTER_TYPE_BUNDLE
+            else "TCP forward"
+        )
+        raise BackendError(
+            code="INVALID_REQUEST",
+            message=f"{mode_name} adapter_config.target_port is required",
+            details={"field": "adapter_config.target_port"},
         )
 
 

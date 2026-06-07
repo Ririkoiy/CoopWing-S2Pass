@@ -6,6 +6,10 @@ import '../models/doctor_report.dart';
 import '../models/game_profile.dart';
 import '../models/server_preset.dart';
 
+/// v0.3-J game profile API types.
+typedef GameProfileList = List<GameProfileDto>;
+typedef PortCandidateList = List<PortCandidateDto>;
+
 abstract class BackendClient {
   Future<HealthStatus> health();
 
@@ -41,6 +45,22 @@ abstract class BackendClient {
 
   Future<SessionInfo> stopSession(String sessionId);
 
+  Future<LanDiscoveryStatus> getLanDiscoveryStatus();
+
+  Future<LanDiscoveryStatus> startLanDiscovery();
+
+  Future<LanDiscoveryStatus> stopLanDiscovery();
+
+  Future<LanDiscoveryPeersResponse> getLanDiscoveryPeers();
+
+  Future<SecondaryIpRecommendation> getSecondaryIpRecommendation();
+
+  Future<Map<String, dynamic>> releaseSecondaryIp();
+
+  Future<Map<String, dynamic>> getSecondaryIpStatus();
+
+  Future<ProcessPortScanResult> scanProcessPorts(int pid);
+
   Future<BackendHealth> getHealth();
 
   Future<AppSettings> getSettings();
@@ -74,4 +94,33 @@ abstract class BackendClient {
   Future<List<LogEvent>> getLogs();
 
   Stream<AppEvent> streamEvents();
+
+  // ── v0.3-J Game Profile API ──────────────────────────────────────
+
+  Future<GameProfileList> listGames();
+
+  Future<GameProfileDto> createGame({
+    required String displayName,
+    required String executablePath,
+    String? workingDirectory,
+    List<String>? launchArgs,
+    String? notes,
+  });
+
+  Future<GameProfileDto> getGame(String gameId);
+
+  Future<void> deleteGame(String gameId);
+
+  Future<ScanResultDto> scanGamePorts(
+    String gameId, {
+    String stage = 'manual',
+    int? processId,
+    bool includeLowConfidence = false,
+  });
+
+  Future<GameProfileDto> confirmGamePorts(
+    String gameId, {
+    required List<int> tcpPorts,
+    required List<int> udpPorts,
+  });
 }

@@ -111,6 +111,14 @@ def _make_info(role="create", force_relay=True):
     )
 
 
+def _alice_participant():
+    return {"player_id": "p_alice000001", "player_name": "Alice", "is_host": True}
+
+
+def _bob_participant():
+    return {"player_id": "p_bob00000002", "player_name": "Bob", "is_host": False}
+
+
 class CoreSessionRunnerTests(unittest.TestCase):
     def setUp(self):
         FakeConfig.reset()
@@ -143,6 +151,8 @@ class CoreSessionRunnerTests(unittest.TestCase):
         self.assertTrue(config.force_relay)
         self.assertTrue(config.is_payload_mode)
         self.assertFalse(config.send_test)
+        self.assertEqual(config.protocol_version, 2)
+        self.assertEqual(config.max_players, 4)
         self.assertNotIn("room_id", config.kwargs)
         runner.stop(info, collector.emit)
 
@@ -156,6 +166,24 @@ class CoreSessionRunnerTests(unittest.TestCase):
         self.assertTrue(fake_core.instance_created.wait(timeout=1.0))
 
         self.assertFalse(FakeConfig.instances[0].force_relay)
+        runner.stop(info, collector.emit)
+
+    def test_choose_adapter_bind_host_mapping(self):
+        fake_core = make_fake_core_class()
+        runner = CoreSessionRunner(core_class=fake_core, config_class=FakeConfig)
+        collector = EventCollector()
+        info = _make_info("create")
+        info.secondary_ip_enabled = True
+        info.secondary_ip_fallback_used = False
+        info.secondary_ip_warning = "secondary IP active"
+
+        runner.start_create(info, collector.emit)
+        self.assertTrue(fake_core.instance_created.wait(timeout=1.0))
+
+        config = FakeConfig.instances[0]
+        self.assertNotIn("secondary_ip_enabled", config.kwargs)
+        self.assertNotIn("secondary_ip_fallback_used", config.kwargs)
+        self.assertNotIn("secondary_ip_warning", config.kwargs)
         runner.stop(info, collector.emit)
 
     def test_transport_factory_called_once_with_core_and_owning_loop(self):
@@ -287,6 +315,8 @@ class CoreSessionRunnerTests(unittest.TestCase):
         self.assertTrue(config.force_relay)
         self.assertTrue(config.is_payload_mode)
         self.assertFalse(config.send_test)
+        self.assertEqual(config.protocol_version, 2)
+        self.assertEqual(config.max_players, 4)
         runner.stop(info, collector.emit)
 
     def test_start_create_returns_without_blocking(self):
@@ -330,6 +360,37 @@ class CoreSessionRunnerTests(unittest.TestCase):
         self.assertEqual(collector.data_for("room_created")[0]["room_id"], "XYZ789")
         self.assertTrue(runner.wait(timeout=1.0))
 
+    def test_room_created_preserves_v2_participant_snapshot(self):
+        fake_core = make_fake_core_class(
+            events=[
+                FakeCoreEvent(
+                    "ROOM_CREATED",
+                    data={
+                        "room_id": "V2ROOM",
+                        "player_id": "p_alice000001",
+                        "protocol_version": 2,
+                        "max_players": 4,
+                        "participants": [_alice_participant()],
+                        "participant_count": 1,
+                    },
+                )
+            ],
+            finish_after_events=True,
+        )
+        runner = CoreSessionRunner(core_class=fake_core, config_class=FakeConfig)
+        collector = EventCollector()
+        info = _make_info("create")
+
+        runner.start_create(info, collector.emit)
+
+        self.assertTrue(collector.wait_for("room_created"))
+        data = collector.data_for("room_created")[0]
+        self.assertEqual(data["protocol_version"], 2)
+        self.assertEqual(data["max_players"], 4)
+        self.assertEqual(data["participant_count"], 1)
+        self.assertEqual(data["participants"], [_alice_participant()])
+        self.assertTrue(runner.wait(timeout=1.0))
+
     def test_room_joined_maps_to_backend_event(self):
         fake_core = make_fake_core_class(
             events=[FakeCoreEvent("ROOM_JOINED", data={})],
@@ -343,6 +404,90 @@ class CoreSessionRunnerTests(unittest.TestCase):
 
         self.assertTrue(collector.wait_for("room_joined"))
         self.assertEqual(collector.data_for("room_joined")[0]["room_id"], info.room_id)
+        self.assertTrue(runner.wait(timeout=1.0))
+
+    def test_room_joined_preserves_v2_participant_snapshot(self):
+        fake_core = make_fake_core_class(
+            events=[
+                FakeCoreEvent(
+                    "ROOM_JOINED",
+                    data={
+                        "room_id": "V2ROOM",
+                        "player_id": "p_bob00000002",
+                        "protocol_version": 2,
+                        "max_players": 4,
+                        "participants": [_alice_participant(), _bob_participant()],
+                        "participant_count": 2,
+                    },
+                )
+            ],
+            finish_after_events=True,
+        )
+        runner = CoreSessionRunner(core_class=fake_core, config_class=FakeConfig)
+        collector = EventCollector()
+        info = _make_info("join")
+
+        runner.start_join(info, collector.emit)
+
+        self.assertTrue(collector.wait_for("room_joined"))
+        data = collector.data_for("room_joined")[0]
+        self.assertEqual(data["protocol_version"], 2)
+        self.assertEqual(data["max_players"], 4)
+        self.assertEqual(data["participant_count"], 2)
+        self.assertEqual(data["participants"], [_alice_participant(), _bob_participant()])
+        self.assertTrue(runner.wait(timeout=1.0))
+
+    def test_room_updated_maps_to_backend_event_with_full_snapshot(self):
+        fake_core = make_fake_core_class(
+            events=[
+                FakeCoreEvent(
+                    "ROOM_UPDATED",
+                    data={
+                        "room_id": "V2ROOM",
+                        "event": "participant_joined",
+                        "participant_count": 2,
+                        "max_players": 4,
+                        "host_player_id": "p_alice000001",
+                        "participants": [_alice_participant(), _bob_participant()],
+                        "server_time": 1716192000.0,
+                    },
+                )
+            ],
+            finish_after_events=True,
+        )
+        runner = CoreSessionRunner(core_class=fake_core, config_class=FakeConfig)
+        collector = EventCollector()
+        info = _make_info("create")
+
+        runner.start_create(info, collector.emit)
+
+        self.assertTrue(collector.wait_for("room_updated"))
+        data = collector.data_for("room_updated")[0]
+        self.assertEqual(data["event"], "participant_joined")
+        self.assertEqual(data["participants"], [_alice_participant(), _bob_participant()])
+        self.assertEqual(data["host_player_id"], "p_alice000001")
+        self.assertTrue(runner.wait(timeout=1.0))
+
+    def test_participant_and_room_lifecycle_events_map_to_backend_names(self):
+        fake_core = make_fake_core_class(
+            events=[
+                FakeCoreEvent("PARTICIPANT_JOINED", data={"player_id": "p_bob00000002"}),
+                FakeCoreEvent("PARTICIPANT_LEFT", data={"player_id": "p_bob00000002"}),
+                FakeCoreEvent("ROOM_READY", data={"room_id": "V2ROOM"}),
+                FakeCoreEvent("ROOM_CLOSED", data={"room_id": "V2ROOM"}),
+            ],
+            finish_after_events=True,
+        )
+        runner = CoreSessionRunner(core_class=fake_core, config_class=FakeConfig)
+        collector = EventCollector()
+        info = _make_info("create")
+
+        runner.start_create(info, collector.emit)
+
+        self.assertTrue(collector.wait_for("participant_joined"))
+        self.assertTrue(collector.wait_for("participant_left"))
+        self.assertTrue(collector.wait_for("room_ready"))
+        self.assertTrue(collector.wait_for("room_closed"))
         self.assertTrue(runner.wait(timeout=1.0))
 
     def test_relay_enabled_maps_to_ready_and_running(self):
@@ -456,6 +601,36 @@ class CoreSessionRunnerTests(unittest.TestCase):
         relay_data = collector.data_for("relay_ready")[0]
         self.assertNotIn("relay_token", relay_data)
         self.assertEqual(relay_data["relay_port"], 9001)
+        self.assertTrue(runner.wait(timeout=1.0))
+
+    def test_relay_enabled_marks_token_available_and_preserves_target(self):
+        fake_core = make_fake_core_class(
+            events=[
+                FakeCoreEvent(
+                    "RELAY_ENABLED",
+                    data={
+                        "relay_token": "rtk_secret",
+                        "relay_ip": "198.51.100.10",
+                        "relay_port": 9001,
+                        "relay_target_host": "203.0.113.10",
+                        "relay_target_port": 9001,
+                    },
+                )
+            ],
+            finish_after_events=True,
+        )
+        runner = CoreSessionRunner(core_class=fake_core, config_class=FakeConfig)
+        collector = EventCollector()
+        info = _make_info("create")
+
+        runner.start_create(info, collector.emit)
+
+        self.assertTrue(collector.wait_for("relay_ready"))
+        relay_data = collector.data_for("relay_ready")[0]
+        self.assertTrue(relay_data["relay_token_available"])
+        self.assertEqual(relay_data["relay_target_host"], "203.0.113.10")
+        self.assertEqual(relay_data["relay_target_port"], 9001)
+        self.assertNotIn("relay_token", relay_data)
         self.assertTrue(runner.wait(timeout=1.0))
 
     def test_core_session_runner_static_boundaries(self):

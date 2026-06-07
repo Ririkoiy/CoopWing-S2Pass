@@ -19,7 +19,19 @@ import json
 import ast
 from pathlib import Path
 
-from network_core import S2PassClientCore, S2PassConfig, S2PassEvent
+from network_core import (
+    S2PassClientCore,
+    S2PassConfig,
+    S2PassEvent,
+    EVT_ROOM_CREATED,
+    EVT_ROOM_JOINED,
+    EVT_ROOM_UPDATED,
+    EVT_RELAY_ENABLED,
+    EVT_PARTICIPANT_JOINED,
+    EVT_PARTICIPANT_LEFT,
+    EVT_ROOM_READY,
+    EVT_ROOM_CLOSED,
+)
 
 class TestRelayIpFallback(unittest.TestCase):
     """
@@ -143,6 +155,257 @@ class TestProtocolBuilders(unittest.TestCase):
         self.assertEqual(json_header.get("relay_token"), "TOKEN123")
         self.assertEqual(json_header.get("player_id"), "P1")
         self.assertEqual(payload, b"hello")
+
+    def test_build_create_room_v2_uses_locked_fields(self):
+        config = S2PassConfig(
+            host="127.0.0.1",
+            player_name="Alice",
+            protocol_version=2,
+            max_players=4,
+        )
+        core = S2PassClientCore(config)
+
+        obj = json.loads(core._build_create_room().strip())
+
+        self.assertEqual(obj.get("type"), "CREATE_ROOM")
+        self.assertEqual(
+            obj.get("payload"),
+            {
+                "player_name": "Alice",
+                "protocol_version": 2,
+                "max_players": 4,
+            },
+        )
+
+    def test_build_join_room_v2_uses_locked_fields(self):
+        config = S2PassConfig(
+            host="127.0.0.1",
+            player_name="Bob",
+            room_id="ABC123",
+            protocol_version=2,
+            role="join",
+        )
+        core = S2PassClientCore(config)
+        core.room_id = "ABC123"
+
+        obj = json.loads(core._build_join_room().strip())
+
+        self.assertEqual(obj.get("type"), "JOIN_ROOM")
+        self.assertEqual(
+            obj.get("payload"),
+            {
+                "room_id": "ABC123",
+                "player_name": "Bob",
+                "protocol_version": 2,
+            },
+        )
+
+
+class TestV2EventMapping(unittest.TestCase):
+    """
+    v0.3-F: map v2 server TCP messages to client-side events.
+    """
+    def setUp(self):
+        self.events = []
+        self.core = S2PassClientCore(
+            S2PassConfig(host="127.0.0.1", protocol_version=2),
+            event_callback=self.events.append,
+        )
+
+    @staticmethod
+    def _participant(player_id, player_name, is_host=False):
+        return {
+            "player_id": player_id,
+            "player_name": player_name,
+            "is_host": is_host,
+        }
+
+    def _event_types(self):
+        return [event.type for event in self.events]
+
+    def test_v2_room_created_maps_participants_and_room_metadata(self):
+        participants = [self._participant("p_aaaaaaaaaaaa", "Alice", True)]
+
+        asyncio.run(self.core._handle_tcp_message("ROOM_CREATED", {
+            "room_id": "ABC123",
+            "player_id": "p_aaaaaaaaaaaa",
+            "protocol_version": 2,
+            "max_players": 4,
+            "participants": participants,
+            "participant_count": 1,
+        }))
+
+        self.assertEqual(self._event_types(), [EVT_ROOM_CREATED])
+        event = self.events[0]
+        self.assertEqual(event.data["room_id"], "ABC123")
+        self.assertEqual(event.data["player_id"], "p_aaaaaaaaaaaa")
+        self.assertEqual(event.data["protocol_version"], 2)
+        self.assertEqual(event.data["max_players"], 4)
+        self.assertEqual(event.data["participants"], participants)
+        self.assertEqual(event.data["participant_count"], 1)
+        self.assertEqual(self.core.participants, participants)
+
+    def test_v2_room_joined_maps_participants_room_and_player(self):
+        participants = [
+            self._participant("p_aaaaaaaaaaaa", "Alice", True),
+            self._participant("p_bbbbbbbbbbbb", "Bob"),
+        ]
+
+        asyncio.run(self.core._handle_tcp_message("ROOM_JOINED", {
+            "room_id": "ABC123",
+            "player_id": "p_bbbbbbbbbbbb",
+            "protocol_version": 2,
+            "max_players": 4,
+            "participants": participants,
+            "participant_count": 2,
+        }))
+
+        self.assertEqual(self._event_types(), [EVT_ROOM_JOINED])
+        event = self.events[0]
+        self.assertEqual(event.data["room_id"], "ABC123")
+        self.assertEqual(event.data["player_id"], "p_bbbbbbbbbbbb")
+        self.assertEqual(event.data["protocol_version"], 2)
+        self.assertEqual(event.data["max_players"], 4)
+        self.assertEqual(event.data["participants"], participants)
+        self.assertEqual(event.data["participant_count"], 2)
+
+    def test_v2_room_updated_participant_joined_maps_full_and_specific_event(self):
+        self.core.room_id = "ABC123"
+        self.core.participants = [
+            self._participant("p_aaaaaaaaaaaa", "Alice", True),
+            self._participant("p_bbbbbbbbbbbb", "Bob"),
+        ]
+        participants = self.core.participants + [
+            self._participant("p_cccccccccccc", "Carol"),
+        ]
+
+        self.core._handle_room_updated({
+            "room_id": "ABC123",
+            "event": "participant_joined",
+            "participant_count": 3,
+            "max_players": 4,
+            "host_player_id": "p_aaaaaaaaaaaa",
+            "participants": participants,
+            "server_time": 1716192000.25,
+        })
+
+        self.assertEqual(self._event_types(), [
+            EVT_ROOM_UPDATED,
+            EVT_PARTICIPANT_JOINED,
+        ])
+        updated = self.events[0]
+        joined = self.events[1]
+        self.assertEqual(updated.data["event"], "participant_joined")
+        self.assertEqual(updated.data["participants"], participants)
+        self.assertEqual(updated.data["participant_count"], 3)
+        self.assertEqual(updated.data["max_players"], 4)
+        self.assertEqual(updated.data["host_player_id"], "p_aaaaaaaaaaaa")
+        self.assertEqual(updated.data["room_id"], "ABC123")
+        self.assertEqual(updated.data["server_time"], 1716192000.25)
+        self.assertEqual(joined.data["player_id"], "p_cccccccccccc")
+
+    def test_v2_room_updated_participant_left_maps_full_and_specific_event(self):
+        self.core.room_id = "ABC123"
+        self.core.participants = [
+            self._participant("p_aaaaaaaaaaaa", "Alice", True),
+            self._participant("p_bbbbbbbbbbbb", "Bob"),
+            self._participant("p_cccccccccccc", "Carol"),
+        ]
+        participants = [
+            self._participant("p_aaaaaaaaaaaa", "Alice", True),
+            self._participant("p_cccccccccccc", "Carol"),
+        ]
+
+        self.core._handle_room_updated({
+            "room_id": "ABC123",
+            "event": "participant_left",
+            "participant_count": 2,
+            "max_players": 4,
+            "host_player_id": "p_aaaaaaaaaaaa",
+            "participants": participants,
+            "server_time": 1716192001.0,
+        })
+
+        self.assertEqual(self._event_types(), [
+            EVT_ROOM_UPDATED,
+            EVT_PARTICIPANT_LEFT,
+        ])
+        self.assertEqual(self.events[1].data["player_id"], "p_bbbbbbbbbbbb")
+        self.assertEqual(self.core.participants, participants)
+
+    def test_v2_room_updated_room_ready_maps_ready_event(self):
+        participants = [
+            self._participant("p_aaaaaaaaaaaa", "Alice", True),
+            self._participant("p_bbbbbbbbbbbb", "Bob"),
+        ]
+
+        self.core._handle_room_updated({
+            "room_id": "ABC123",
+            "event": "room_ready",
+            "participant_count": 2,
+            "max_players": 4,
+            "host_player_id": "p_aaaaaaaaaaaa",
+            "participants": participants,
+            "server_time": 1716192002.0,
+        })
+
+        self.assertEqual(self._event_types(), [EVT_ROOM_UPDATED, EVT_ROOM_READY])
+        self.assertEqual(self.events[1].data["room_id"], "ABC123")
+
+    def test_v2_room_updated_room_closed_maps_closed_event(self):
+        participants = [self._participant("p_cccccccccccc", "Carol")]
+
+        self.core._handle_room_updated({
+            "room_id": "ABC123",
+            "event": "room_closed",
+            "participant_count": 1,
+            "max_players": 4,
+            "host_player_id": "p_aaaaaaaaaaaa",
+            "participants": participants,
+            "server_time": 1716192003.0,
+        })
+
+        self.assertEqual(self._event_types(), [EVT_ROOM_UPDATED, EVT_ROOM_CLOSED])
+        self.assertEqual(self.events[1].data["room_id"], "ABC123")
+
+    def test_v2_relay_enabled_maps_player_and_relay_target(self):
+        self.core.player_id = "p_bbbbbbbbbbbb"
+
+        asyncio.run(self.core._handle_tcp_message("RELAY_ENABLED", {
+            "room_id": "ABC123",
+            "relay_token": "rtk_abcdef0123456789",
+            "relay_ip": "120.27.210.184",
+            "relay_port": 9001,
+        }))
+
+        self.assertEqual(self._event_types(), [EVT_RELAY_ENABLED])
+        event = self.events[0]
+        self.assertEqual(event.data["player_id"], "p_bbbbbbbbbbbb")
+        self.assertEqual(event.data["relay_token"], "rtk_abcdef0123456789")
+        self.assertEqual(event.data["relay_ip"], "120.27.210.184")
+        self.assertEqual(event.data["relay_port"], 9001)
+        self.assertEqual(event.data["relay_target_host"], "120.27.210.184")
+        self.assertEqual(event.data["relay_target_port"], 9001)
+
+    def test_v2_room_updated_identical_consecutive_update_is_deduplicated(self):
+        participants = [
+            self._participant("p_aaaaaaaaaaaa", "Alice", True),
+            self._participant("p_bbbbbbbbbbbb", "Bob"),
+        ]
+        payload = {
+            "room_id": "ABC123",
+            "event": "room_ready",
+            "participant_count": 2,
+            "max_players": 4,
+            "host_player_id": "p_aaaaaaaaaaaa",
+            "participants": participants,
+            "server_time": 1716192004.0,
+        }
+
+        self.core._handle_room_updated(payload)
+        self.core._handle_room_updated(payload)
+
+        self.assertEqual(self._event_types(), [EVT_ROOM_UPDATED, EVT_ROOM_READY])
 
 
 class TestEventEmitter(unittest.TestCase):
@@ -308,6 +571,8 @@ class TestConfigDefaults(unittest.TestCase):
         self.assertEqual(config.pps, 10)
         self.assertEqual(config.duration, 10)
         self.assertEqual(config.packet_size, 64)
+        self.assertIsNone(config.protocol_version)
+        self.assertEqual(config.max_players, 4)
         self.assertEqual(config.udp_reg_count, 3)
         self.assertEqual(config.udp_reg_interval, 0.05)
 

@@ -69,7 +69,7 @@ class AdapterConfigTests(unittest.TestCase):
     def test_defaults(self):
         cfg = AdapterConfig()
         self.assertFalse(cfg.enabled)
-        self.assertEqual(cfg.adapter_type, "local_udp_bridge")
+        self.assertEqual(cfg.adapter_type, "bundle")
         self.assertEqual(cfg.bind_host, "127.0.0.1")
         self.assertEqual(cfg.bind_port, 0)
         self.assertEqual(cfg.target_host, "127.0.0.1")
@@ -87,6 +87,14 @@ class AdapterConfigTests(unittest.TestCase):
         self.assertTrue(cfg.enabled)
         self.assertEqual(cfg.bind_port, 40100)
         self.assertEqual(cfg.target_port, 40200)
+
+    def test_enabled_request_without_explicit_type_defaults_to_bundle(self):
+        cfg = AdapterConfig.from_dict({
+            "enabled": True,
+            "target_port": 27015,
+        })
+
+        self.assertEqual(cfg.adapter_type, "bundle")
 
 
 class AdapterStatusTests(unittest.TestCase):

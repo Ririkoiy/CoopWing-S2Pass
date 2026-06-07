@@ -128,6 +128,56 @@ class HttpBackendClient implements BackendClient {
   }
 
   @override
+  Future<LanDiscoveryStatus> getLanDiscoveryStatus() async {
+    final json = await _request('GET', '/api/lan-discovery/status');
+    return LanDiscoveryStatus.fromJson(json);
+  }
+
+  @override
+  Future<LanDiscoveryStatus> startLanDiscovery() async {
+    final json = await _request('POST', '/api/lan-discovery/start');
+    return LanDiscoveryStatus.fromJson(json);
+  }
+
+  @override
+  Future<LanDiscoveryStatus> stopLanDiscovery() async {
+    final json = await _request('POST', '/api/lan-discovery/stop');
+    return LanDiscoveryStatus.fromJson(json);
+  }
+
+  @override
+  Future<LanDiscoveryPeersResponse> getLanDiscoveryPeers() async {
+    final json = await _request('GET', '/api/lan-discovery/peers');
+    return LanDiscoveryPeersResponse.fromJson(json);
+  }
+
+  @override
+  Future<SecondaryIpRecommendation> getSecondaryIpRecommendation() async {
+    final json = await _request('GET', '/api/secondary-ip/recommendation');
+    return SecondaryIpRecommendation.fromJson(json);
+  }
+
+  @override
+  Future<Map<String, dynamic>> releaseSecondaryIp() async {
+    return await _request('POST', '/api/secondary-ip/release');
+  }
+
+  @override
+  Future<Map<String, dynamic>> getSecondaryIpStatus() async {
+    return await _request('GET', '/api/secondary-ip/status');
+  }
+
+  @override
+  Future<ProcessPortScanResult> scanProcessPorts(int pid) async {
+    final json = await _request(
+      'POST',
+      '/process-ports/scan',
+      body: {'pid': pid},
+    );
+    return ProcessPortScanResult.fromJson(json);
+  }
+
+  @override
   Future<BackendHealth> getHealth() async {
     final value = await health();
     return BackendHealth(
@@ -305,6 +355,87 @@ class HttpBackendClient implements BackendClient {
         details: {'error': error.message},
       );
     }
+  }
+
+  // ── v0.3-J Game Profile API (wired to HTTP) ──────────────────────
+
+  @override
+  Future<GameProfileList> listGames() async {
+    final json = await _request('GET', '/api/games');
+    final games = json['games'];
+    if (games is! List<Object?>) return [];
+    return games
+        .whereType<Map<dynamic, dynamic>>()
+        .map((e) => GameProfileDto.fromJson(_asObjectMap(e)))
+        .toList(growable: false);
+  }
+
+  @override
+  Future<GameProfileDto> createGame({
+    required String displayName,
+    required String executablePath,
+    String? workingDirectory,
+    List<String>? launchArgs,
+    String? notes,
+  }) async {
+    final body = <String, Object?>{
+      'display_name': displayName,
+      'executable_path': executablePath,
+    };
+    if (workingDirectory != null) body['working_directory'] = workingDirectory;
+    if (launchArgs != null) body['launch_args'] = launchArgs;
+    if (notes != null) body['notes'] = notes;
+    final json = await _request('POST', '/api/games', body: body);
+    return GameProfileDto.fromJson(json);
+  }
+
+  @override
+  Future<GameProfileDto> getGame(String gameId) async {
+    final json = await _request('GET', '/api/games/$gameId');
+    return GameProfileDto.fromJson(json);
+  }
+
+  @override
+  Future<void> deleteGame(String gameId) async {
+    await _request('DELETE', '/api/games/$gameId');
+  }
+
+  @override
+  Future<ScanResultDto> scanGamePorts(
+    String gameId, {
+    String stage = 'manual',
+    int? processId,
+    bool includeLowConfidence = false,
+  }) async {
+    final body = <String, Object?>{
+      'stage': stage,
+      'include_low_confidence': includeLowConfidence,
+    };
+    if (processId != null) body['process_id'] = processId;
+    final json = await _request(
+      'POST',
+      '/api/games/$gameId/scan-ports',
+      body: body,
+    );
+    return ScanResultDto.fromJson(json);
+  }
+
+  @override
+  Future<GameProfileDto> confirmGamePorts(
+    String gameId, {
+    required List<int> tcpPorts,
+    required List<int> udpPorts,
+  }) async {
+    final body = <String, Object?>{
+      'tcp_ports': tcpPorts,
+      'udp_ports': udpPorts,
+    };
+    final json = await _request(
+      'POST',
+      '/api/games/$gameId/confirm-ports',
+      body: body,
+    );
+    return GameProfileDto.fromJson(json);
   }
 }
 

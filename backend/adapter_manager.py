@@ -15,29 +15,49 @@ from adapters.profile import GameProfile
 from adapters.tcp_adapter import GenericTcpForwardAdapter
 from adapters.tcp_relay_adapter import TcpRelayAdapter
 from adapters.transport import Transport
+from backend.bundle_runner import (
+    BundleRunner,
+    allocate_tcp_udp_port,
+    allocate_udp_port,
+)
 from backend.models import (
     ADAPTER_STATUS_ERROR,
     ADAPTER_STATUS_READY,
     ADAPTER_STATUS_STOPPED,
+    ADAPTER_TYPE_BUNDLE,
     ADAPTER_TYPE_TCP_FORWARD,
     ADAPTER_TYPE_TCP_RELAY,
+    BUNDLE_RULE_TCP_FORWARD,
+    BUNDLE_RULE_UDP_BROADCAST_FORWARD,
+    BUNDLE_RULE_UDP_FORWARD,
     AdapterConfig,
     AdapterCounters,
     AdapterStatus,
+    BundleConfig,
+    BundleRule,
 )
 
 TransportFactory = Callable[[str, AdapterConfig], Transport]
+BundleRunnerFactory = Callable[[], BundleRunner]
 
 
 class AdapterManager:
     """Manage adapter status and optional test/future transport-backed bridges."""
 
-    def __init__(self, transport_factory: Optional[TransportFactory] = None) -> None:
+    def __init__(
+        self,
+        transport_factory: Optional[TransportFactory] = None,
+        bundle_transport_factory: Optional[TransportFactory] = None,
+        bundle_runner_factory: Optional[BundleRunnerFactory] = None,
+    ) -> None:
         self._configs: Dict[str, AdapterConfig] = {}
         self._statuses: Dict[str, AdapterStatus] = {}
         self._adapters: Dict[str, AdapterBase] = {}
+        self._bundle_runners: Dict[str, BundleRunner] = {}
         self._transports: Dict[str, Transport] = {}
         self._transport_factory = transport_factory
+        self._bundle_transport_factory = bundle_transport_factory
+        self._bundle_runner_factory = bundle_runner_factory
         self._lock = threading.Lock()
 
     def configure(
@@ -48,9 +68,12 @@ class AdapterManager:
         """Store passive config and return the initial passive status."""
         with self._lock:
             adapter = self._adapters.pop(session_id, None)
+            bundle_runner = self._bundle_runners.pop(session_id, None)
             transport = self._transports.pop(session_id, None)
             if adapter is not None:
                 adapter.stop()
+            if bundle_runner is not None:
+                bundle_runner.stop()
             self._close_transport(transport)
             if adapter_config is None:
                 self._configs.pop(session_id, None)
@@ -96,10 +119,17 @@ class AdapterManager:
                 return None
             if not config.enabled:
                 return status
-            if session_id in self._adapters:
+            if (
+                session_id in self._adapters
+                or session_id in self._bundle_runners
+            ):
                 return self._snapshot_locked(session_id)
+            is_bundle = config.adapter_type == ADAPTER_TYPE_BUNDLE
             is_tcp = config.adapter_type == ADAPTER_TYPE_TCP_FORWARD
             is_tcp_relay = config.adapter_type == ADAPTER_TYPE_TCP_RELAY
+
+        if is_bundle:
+            return self._start_bundle(session_id, config)
 
         # --- TCP forward path (no transport needed) ---
         if is_tcp:
@@ -211,16 +241,27 @@ class AdapterManager:
             config = self._configs.get(session_id)
             status = self._statuses.get(session_id)
             adapter = self._adapters.pop(session_id, None)
+            bundle_runner = self._bundle_runners.pop(session_id, None)
             transport = self._transports.pop(session_id, None)
         if config is None or status is None:
             self._close_transport(transport)
             return None
-        self._close_transport(transport)
         if adapter is not None:
+            self._close_transport(transport)
             adapter.stop()
+        bundle_result = None
+        if bundle_runner is not None:
+            bundle_result = bundle_runner.stop()
+            self._close_transport(transport)
+        elif adapter is None:
+            self._close_transport(transport)
         if not config.enabled:
             return self.snapshot(session_id)
-        if adapter is None and status.status == ADAPTER_STATUS_STOPPED:
+        if (
+            adapter is None
+            and bundle_runner is None
+            and status.status == ADAPTER_STATUS_STOPPED
+        ):
             return self.snapshot(session_id)
 
         stopped = AdapterStatus.from_config(config, status=ADAPTER_STATUS_STOPPED)
@@ -228,6 +269,15 @@ class AdapterManager:
             stopped.bind_host = status.bind_host
             stopped.bind_port = status.bind_port
             stopped.counters = status.counters
+        if bundle_result is not None:
+            diagnostics = dict(status.payload_diagnostics or {})
+            diagnostics.update(bundle_result.to_dict())
+            stopped.payload_diagnostics = diagnostics
+            if bundle_result.cleanup_errors:
+                stopped.error = {
+                    "code": "BUNDLE_STOP_FAILED",
+                    "message": "; ".join(bundle_result.cleanup_errors),
+                }
         with self._lock:
             self._statuses[session_id] = stopped
             return self._snapshot_locked(session_id)
@@ -240,6 +290,7 @@ class AdapterManager:
     def _snapshot_locked(self, session_id: str) -> Optional[AdapterStatus]:
         status = self._statuses.get(session_id)
         adapter = self._adapters.get(session_id)
+        bundle_runner = self._bundle_runners.get(session_id)
         if status is None:
             return None
         if adapter is not None and status.enabled:
@@ -262,6 +313,14 @@ class AdapterManager:
                 diag_fn = getattr(transport, "get_payload_diagnostics", None)
                 if diag_fn is not None:
                     status.payload_diagnostics = diag_fn()
+        if bundle_runner is not None and status.enabled:
+            snapshot = getattr(bundle_runner, "snapshot", None)
+            if callable(snapshot):
+                rule_statuses = snapshot()
+                diagnostics = dict(status.payload_diagnostics or {})
+                diagnostics["rules"] = rule_statuses
+                status.payload_diagnostics = diagnostics
+                status.counters = _bundle_counters(rule_statuses)
         return status
 
     def _set_error(
@@ -279,6 +338,169 @@ class AdapterManager:
         with self._lock:
             self._statuses[session_id] = error_status
             return error_status
+
+    def _start_bundle(
+        self,
+        session_id: str,
+        config: AdapterConfig,
+    ) -> AdapterStatus:
+        if config.target_port is None:
+            return self._set_error(
+                session_id,
+                config,
+                "BUNDLE_START_FAILED",
+                "Bundle target_port is required",
+            )
+
+        try:
+            bind_port = (
+                config.bind_port
+                if config.bind_port != 0
+                else allocate_tcp_udp_port(config.bind_host)
+            )
+            broadcast_bind_port = allocate_udp_port(
+                config.bind_host,
+                excluded_port=bind_port,
+            )
+            transport = self._bundle_transport(session_id, config)
+            bundle = self._bundle_from_config(
+                session_id,
+                config,
+                bind_port,
+                broadcast_bind_port,
+            )
+            runner = (
+                self._bundle_runner_factory()
+                if self._bundle_runner_factory is not None
+                else BundleRunner(transport_factory=lambda rule: transport)
+            )
+            result = runner.start(bundle)
+        except Exception as exc:
+            with self._lock:
+                failed_transport = self._transports.pop(session_id, None)
+            self._close_transport(failed_transport)
+            return self._set_error(
+                session_id,
+                config,
+                "BUNDLE_START_FAILED",
+                str(exc),
+            )
+
+        if not result.ok:
+            with self._lock:
+                failed_transport = self._transports.pop(session_id, None)
+            self._close_transport(failed_transport)
+            error_status = self._set_error(
+                session_id,
+                config,
+                "BUNDLE_START_FAILED",
+                result.error_detail or "Bundle failed to start",
+            )
+            error_status.payload_diagnostics = self._bundle_diagnostics(
+                result.to_dict(),
+                bundle,
+                broadcast_bind_port,
+            )
+            return error_status
+
+        ready = AdapterStatus(
+            enabled=True,
+            status=ADAPTER_STATUS_READY,
+            adapter_type=ADAPTER_TYPE_BUNDLE,
+            bind_host=config.bind_host,
+            bind_port=bind_port,
+            target_host=config.target_host,
+            target_port=config.target_port,
+            counters=AdapterCounters(),
+            error=None,
+            payload_diagnostics=self._bundle_diagnostics(
+                result.to_dict(),
+                bundle,
+                broadcast_bind_port,
+            ),
+        )
+        with self._lock:
+            self._bundle_runners[session_id] = runner
+            self._statuses[session_id] = ready
+            return self._snapshot_locked(session_id)
+
+    @staticmethod
+    def _bundle_from_config(
+        session_id: str,
+        config: AdapterConfig,
+        bind_port: int,
+        broadcast_bind_port: int,
+    ) -> BundleConfig:
+        rule_config = {
+            "local_bind_host": config.bind_host,
+            "local_bind_port": bind_port,
+            "remote_target_host": config.target_host,
+            "remote_target_port": config.target_port,
+        }
+        return BundleConfig(
+            id=f"{session_id}_bundle",
+            rules=[
+                BundleRule(
+                    id=f"{session_id}_tcp",
+                    kind=BUNDLE_RULE_TCP_FORWARD,
+                    config=dict(rule_config),
+                ),
+                BundleRule(
+                    id=f"{session_id}_udp",
+                    kind=BUNDLE_RULE_UDP_FORWARD,
+                    config=dict(rule_config),
+                ),
+                BundleRule(
+                    id=f"{session_id}_udp_broadcast",
+                    kind=BUNDLE_RULE_UDP_BROADCAST_FORWARD,
+                    config={
+                        **rule_config,
+                        "local_bind_port": broadcast_bind_port,
+                    },
+                ),
+            ],
+        )
+
+    def _bundle_transport(
+        self,
+        session_id: str,
+        config: AdapterConfig,
+    ) -> Transport:
+        with self._lock:
+            transport = self._transports.get(session_id)
+        if transport is not None:
+            return transport
+        if self._bundle_transport_factory is None:
+            raise RuntimeError(
+                "UDP broadcast/LAN discovery forwarding requires "
+                "an available bundle transport"
+            )
+        transport = self._bundle_transport_factory(session_id, config)
+        with self._lock:
+            if session_id not in self._configs or not self._configs[session_id].enabled:
+                self._close_transport(transport)
+                raise RuntimeError("Bundle session is no longer configured")
+            old_transport = self._transports.pop(session_id, None)
+            self._transports[session_id] = transport
+        self._close_transport(old_transport)
+        return transport
+
+    @staticmethod
+    def _bundle_diagnostics(
+        result: Dict[str, object],
+        bundle: BundleConfig,
+        broadcast_bind_port: int,
+    ) -> Dict[str, object]:
+        return {
+            **result,
+            "included_rule_kinds": [rule.kind for rule in bundle.rules],
+            "local_game_connection": {
+                "host": bundle.rules[0].config.get("local_bind_host"),
+                "port": bundle.rules[0].config.get("local_bind_port"),
+            },
+            "udp_broadcast_bind_port": broadcast_bind_port,
+            "udp_broadcast_lan_discovery_included": True,
+        }
 
     def _profile_from_config(self, session_id: str, config: AdapterConfig) -> GameProfile:
         if config.adapter_type == ADAPTER_TYPE_TCP_FORWARD:
@@ -309,3 +531,41 @@ class AdapterManager:
                 close()
             except Exception:
                 pass
+
+
+def _bundle_counters(rule_statuses: list[dict[str, object]]) -> AdapterCounters:
+    counters = AdapterCounters()
+    for rule in rule_statuses:
+        stats = rule.get("stats")
+        if not isinstance(stats, dict):
+            continue
+        kind = rule.get("kind")
+        if kind == BUNDLE_RULE_TCP_FORWARD:
+            bytes_to_target = _int_stat(stats, "bytes_forwarded_to_target")
+            bytes_to_client = _int_stat(stats, "bytes_forwarded_to_client")
+            counters.bytes_from_game += bytes_to_target
+            counters.bytes_to_game += bytes_to_client
+            if bytes_to_target:
+                counters.packets_from_game += _int_stat(stats, "total_connections")
+            if bytes_to_client:
+                counters.packets_to_game += _int_stat(stats, "total_connections")
+        elif kind == BUNDLE_RULE_UDP_FORWARD:
+            counters.packets_from_game += _int_stat(stats, "received_packets")
+            counters.packets_to_transport += _int_stat(stats, "sent_packets")
+            counters.bytes_from_game += _int_stat(stats, "received_bytes")
+            counters.bytes_to_transport += _int_stat(stats, "sent_bytes")
+        elif kind == BUNDLE_RULE_UDP_BROADCAST_FORWARD:
+            counters.packets_from_game += _int_stat(stats, "packets_from_local")
+            counters.packets_to_transport += _int_stat(stats, "packets_to_transport")
+            counters.packets_from_transport += _int_stat(stats, "packets_from_transport")
+            counters.packets_to_game += _int_stat(stats, "packets_to_local")
+            counters.bytes_from_game += _int_stat(stats, "bytes_from_local")
+            counters.bytes_to_transport += _int_stat(stats, "bytes_to_transport")
+            counters.bytes_from_transport += _int_stat(stats, "bytes_from_transport")
+            counters.bytes_to_game += _int_stat(stats, "bytes_to_local")
+    return counters
+
+
+def _int_stat(stats: dict[str, object], key: str) -> int:
+    value = stats.get(key, 0)
+    return value if type(value) is int else 0

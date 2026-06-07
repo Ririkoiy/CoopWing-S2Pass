@@ -135,6 +135,52 @@ class BundleRunner:
             cleanup_errors=cleanup_errors,
         )
 
+    def snapshot(self) -> List[Dict[str, object]]:
+        """Return backend-local status for started bundle rules."""
+        rules: List[Dict[str, object]] = []
+        for rule, adapter in list(self._started):
+            local_host = rule.config.get("local_bind_host")
+            local_port = rule.config.get("local_bind_port")
+            get_addr = getattr(adapter, "get_local_addr", None)
+            if callable(get_addr):
+                try:
+                    actual_host, actual_port = get_addr()
+                    local_host = actual_host or local_host
+                    local_port = actual_port if actual_port is not None else local_port
+                except Exception:
+                    pass
+
+            stats: Dict[str, object] = {}
+            get_stats = getattr(adapter, "get_stats", None)
+            if callable(get_stats):
+                try:
+                    raw_stats = get_stats()
+                    if isinstance(raw_stats, dict):
+                        stats = dict(raw_stats)
+                except Exception as exc:
+                    stats = {"snapshot_error": f"{exc.__class__.__name__}: {exc}"}
+            running = False
+            is_running = getattr(adapter, "is_running", None)
+            if callable(is_running):
+                try:
+                    running = bool(is_running())
+                except Exception:
+                    running = False
+            elif isinstance(is_running, bool):
+                running = is_running
+
+            rules.append({
+                "id": rule.id,
+                "kind": rule.kind,
+                "local_bind_host": local_host,
+                "local_bind_port": local_port,
+                "remote_target_host": rule.config.get("remote_target_host"),
+                "remote_target_port": rule.config.get("remote_target_port"),
+                "running": running,
+                "stats": stats,
+            })
+        return rules
+
     def _validate(self, bundle: BundleConfig) -> Optional[BundleResult]:
         if not isinstance(bundle, BundleConfig):
             return BundleResult(

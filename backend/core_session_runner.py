@@ -16,6 +16,11 @@ from network_core import S2PassClientCore, S2PassConfig
 
 _CORE_CREATED_EVT = getattr(_core_api, "EVT_" + "ROOM" + "_CREATED")
 _CORE_JOINED_EVT = getattr(_core_api, "EVT_" + "ROOM" + "_JOINED")
+_CORE_UPDATED_EVT = getattr(_core_api, "EVT_" + "ROOM" + "_UPDATED")
+_CORE_PARTICIPANT_JOINED_EVT = getattr(_core_api, "EVT_" + "PARTICIPANT" + "_JOINED")
+_CORE_PARTICIPANT_LEFT_EVT = getattr(_core_api, "EVT_" + "PARTICIPANT" + "_LEFT")
+_CORE_ROOM_READY_EVT = getattr(_core_api, "EVT_" + "ROOM" + "_READY")
+_CORE_ROOM_CLOSED_EVT = getattr(_core_api, "EVT_" + "ROOM" + "_CLOSED")
 _CORE_RELAY_READY = getattr(_core_api, "EVT_" + "RELAY" + "_ENABLED")
 _CORE_ERROR = getattr(_core_api, "EVT_ERROR")
 _CORE_TIMEOUT = getattr(_core_api, "EVT_TIMEOUT")
@@ -272,6 +277,8 @@ class CoreSessionRunner:
             "force_relay": info.force_relay,
             "is_payload_mode": True,
             "send_test": False,
+            "protocol_version": 2,
+            "max_players": info.max_players or 4,
         }
         if role == "join":
             kwargs["room_id"] = info.room_id
@@ -300,10 +307,32 @@ class CoreSessionRunner:
 
         if event_type == _CORE_CREATED_EVT:
             room_id = data.get("room_id") or info.room_id
-            emit("room_created", message or "Room created", {"room_id": room_id})
+            room_data = self._safe_room_data(data)
+            room_data["room_id"] = room_id
+            emit("room_created", message or "Room created", room_data)
         elif event_type == _CORE_JOINED_EVT:
             room_id = data.get("room_id") or info.room_id
-            emit("room_joined", message or "Room joined", {"room_id": room_id})
+            room_data = self._safe_room_data(data)
+            room_data["room_id"] = room_id
+            emit("room_joined", message or "Room joined", room_data)
+        elif event_type == _CORE_UPDATED_EVT:
+            emit("room_updated", message or "Room updated", self._safe_room_data(data))
+        elif event_type == _CORE_PARTICIPANT_JOINED_EVT:
+            emit(
+                "participant_joined",
+                message or "Participant joined",
+                self._safe_room_data(data),
+            )
+        elif event_type == _CORE_PARTICIPANT_LEFT_EVT:
+            emit(
+                "participant_left",
+                message or "Participant left",
+                self._safe_room_data(data),
+            )
+        elif event_type == _CORE_ROOM_READY_EVT:
+            emit("room_ready", message or "Room ready", self._safe_room_data(data))
+        elif event_type == _CORE_ROOM_CLOSED_EVT:
+            emit("room_closed", message or "Room closed", self._safe_room_data(data))
         elif event_type == _CORE_RELAY_READY:
             relay_data = self._safe_relay_data(info.session_id, data)
             emit("relay_ready", message or "Relay path ready", relay_data)
@@ -332,12 +361,23 @@ class CoreSessionRunner:
             return
 
     @staticmethod
-    def _safe_relay_data(session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
-        safe = {"session_id": session_id}
+    def _safe_room_data(data: Dict[str, Any]) -> Dict[str, Any]:
+        safe = {}
         for key, value in data.items():
             if key == "relay_token":
                 continue
             safe[key] = value
+        return safe
+
+    @staticmethod
+    def _safe_relay_data(session_id: str, data: Dict[str, Any]) -> Dict[str, Any]:
+        safe = {"session_id": session_id}
+        relay_token_available = bool(data.get("relay_token"))
+        for key, value in data.items():
+            if key == "relay_token":
+                continue
+            safe[key] = value
+        safe["relay_token_available"] = relay_token_available
         return safe
 
     async def _cleanup_core(self) -> None:

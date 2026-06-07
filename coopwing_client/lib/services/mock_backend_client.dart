@@ -39,7 +39,7 @@ class MockBackendClient implements BackendClient {
     'COOPWING_DEFAULT_RELAY_HOST',
     defaultValue: '120.27.210.184',
   );
-  static const previewVersion = '0.2.0-preview-ui';
+  static const previewVersion = '0.4.0-preview';
   static const defaultBackendApiPort = 21520;
 
   final StreamController<AppEvent> _events =
@@ -50,6 +50,7 @@ class MockBackendClient implements BackendClient {
   final List<SessionInfo> _sessions = [];
   final Map<String, List<SessionEvent>> _sessionLogs = {};
   final List<DoctorReport> _reports = [];
+  bool _lanDiscoveryRunning = false;
   DoctorStatus _doctorStatus = DoctorStatus.idle;
 
   late AppSettings _settings = const AppSettings(
@@ -302,6 +303,28 @@ class MockBackendClient implements BackendClient {
       updatedAt: DateTime.now().millisecondsSinceEpoch / 1000,
       stats: current.stats,
       adapterStatus: current.adapterStatus,
+      playerId: current.playerId,
+      protocolVersion: current.protocolVersion,
+      maxPlayers: current.maxPlayers,
+      participantCount: current.participantCount,
+      participants: current.participants,
+      hostPlayerId: current.hostPlayerId,
+      lastRoomEvent: current.lastRoomEvent,
+      roomReady: current.roomReady,
+      roomClosed: true,
+      relayReady: current.relayReady,
+      relayTokenAvailable: current.relayTokenAvailable,
+      relayTargetHost: current.relayTargetHost,
+      relayTargetPort: current.relayTargetPort,
+      serverTime: current.serverTime,
+      secondaryIpEnabled: current.secondaryIpEnabled,
+      secondaryIpFallbackUsed: current.secondaryIpFallbackUsed,
+      secondaryIpWarning: current.secondaryIpWarning,
+      backendAdmin: current.backendAdmin,
+      secondaryIpBindAddress: current.secondaryIpBindAddress,
+      secondaryIpInterfaceIndex: current.secondaryIpInterfaceIndex,
+      secondaryIpInterfaceAlias: current.secondaryIpInterfaceAlias,
+      adapterBindMode: current.adapterBindMode,
     );
     _sessions[index] = stopped;
     _sessionLogs[sessionId]?.add(
@@ -314,6 +337,112 @@ class MockBackendClient implements BackendClient {
     );
     _emit('session_stopped', 'Backend', 'INFO', 'Mock session stopped.');
     return stopped;
+  }
+
+  @override
+  Future<LanDiscoveryStatus> getLanDiscoveryStatus() async {
+    await _mockDelay();
+    return _lanDiscoveryStatus();
+  }
+
+  @override
+  Future<LanDiscoveryStatus> startLanDiscovery() async {
+    await _mockDelay();
+    _lanDiscoveryRunning = true;
+    _emit(
+      'lan_discovery_started',
+      'Backend',
+      'INFO',
+      'Mock LAN discovery started.',
+    );
+    return _lanDiscoveryStatus();
+  }
+
+  @override
+  Future<LanDiscoveryStatus> stopLanDiscovery() async {
+    await _mockDelay();
+    _lanDiscoveryRunning = false;
+    _emit(
+      'lan_discovery_stopped',
+      'Backend',
+      'INFO',
+      'Mock LAN discovery stopped.',
+    );
+    return _lanDiscoveryStatus();
+  }
+
+  @override
+  Future<LanDiscoveryPeersResponse> getLanDiscoveryPeers() async {
+    await _mockDelay();
+    return LanDiscoveryPeersResponse(
+      running: _lanDiscoveryRunning,
+      peers: _lanDiscoveryRunning ? _lanDiscoveryPeers() : const [],
+    );
+  }
+
+  @override
+  Future<SecondaryIpRecommendation> getSecondaryIpRecommendation() async {
+    await _mockDelay();
+    return const SecondaryIpRecommendation(
+      available: true,
+      backendAdmin: false,
+      interfaceIndex: 18,
+      interfaceAlias: 'Ethernet',
+      interfaceDescription: 'Intel Ethernet',
+      interfaceIp: '192.168.5.42',
+      prefixLength: 24,
+      recommendedIp: '192.168.5.233',
+    );
+  }
+
+  @override
+  Future<Map<String, dynamic>> releaseSecondaryIp() async {
+    await _mockDelay();
+    return <String, dynamic>{'ok': true, 'items': <Map<String, dynamic>>[]};
+  }
+
+  @override
+  Future<Map<String, dynamic>> getSecondaryIpStatus() async {
+    await _mockDelay();
+    return <String, dynamic>{
+      'allocated': false,
+      'backend_admin': false,
+      'interface_index': null,
+      'interface_alias': null,
+      'allocated_ip': null,
+      'prefix_length': null,
+      'bind_mode': 'loopback',
+      'source': 'none',
+      'last_error': null,
+      'original_dhcp_ips': <String>[],
+    };
+  }
+
+  @override
+  Future<ProcessPortScanResult> scanProcessPorts(int pid) async {
+    await _mockDelay();
+    return ProcessPortScanResult(
+      pid: pid,
+      candidates: [
+        ProcessPortCandidate(
+          pid: pid,
+          protocol: 'tcp',
+          localAddress: '0.0.0.0',
+          localPort: 27015,
+          state: 'Listen',
+          confidence: 'high',
+          reason: 'TCP LISTEN on 0.0.0.0:27015',
+        ),
+        ProcessPortCandidate(
+          pid: pid,
+          protocol: 'udp',
+          localAddress: '0.0.0.0',
+          localPort: 27016,
+          confidence: 'high',
+          reason: 'UDP bound 0.0.0.0:27016',
+        ),
+      ],
+    );
   }
 
   @override
@@ -690,6 +819,19 @@ class MockBackendClient implements BackendClient {
     AdapterStatus? adapterStatus,
   }) {
     final now = DateTime.now().millisecondsSinceEpoch / 1000;
+    const participants = [
+      ParticipantDto(
+        playerId: 'p_mock_alice',
+        playerName: 'Alice',
+        isHost: true,
+      ),
+      ParticipantDto(playerId: 'p_mock_bob', playerName: 'Bob', isHost: false),
+      ParticipantDto(
+        playerId: 'p_mock_carol',
+        playerName: 'Carol',
+        isHost: false,
+      ),
+    ];
     return SessionInfo(
       sessionId: 's_${DateTime.now().microsecondsSinceEpoch.toRadixString(16)}',
       role: role,
@@ -708,6 +850,36 @@ class MockBackendClient implements BackendClient {
       updatedAt: now,
       stats: SessionStats.empty(),
       adapterStatus: adapterStatus,
+      playerId: role == 'create' ? 'p_mock_alice' : 'p_mock_bob',
+      protocolVersion: 2,
+      maxPlayers: 4,
+      participantCount: participants.length,
+      participants: participants,
+      hostPlayerId: 'p_mock_alice',
+      lastRoomEvent: 'room_ready',
+      roomReady: true,
+      roomClosed: false,
+      relayReady: true,
+      relayTokenAvailable: true,
+      relayTargetHost: serverHost,
+      relayTargetPort: serverUdpPort,
+      serverTime: now,
+      secondaryIpEnabled:
+          adapterStatus?.bindHost != null &&
+          adapterStatus!.bindHost != '127.0.0.1',
+      secondaryIpFallbackUsed: false,
+      secondaryIpWarning: null,
+      backendAdmin: false,
+      secondaryIpBindAddress:
+          adapterStatus?.bindHost == null ||
+              adapterStatus!.bindHost == '127.0.0.1'
+          ? null
+          : adapterStatus.bindHost,
+      adapterBindMode:
+          adapterStatus?.bindHost == null ||
+              adapterStatus!.bindHost == '127.0.0.1'
+          ? 'loopback'
+          : 'secondary_ip',
     );
   }
 
@@ -727,6 +899,189 @@ class MockBackendClient implements BackendClient {
       counters: AdapterCounters.empty(),
     );
   }
+
+  LanDiscoveryStatus _lanDiscoveryStatus() {
+    return LanDiscoveryStatus(
+      running: _lanDiscoveryRunning,
+      peerId: _lanDiscoveryRunning ? 'peer_mock_local' : null,
+      instanceName: 'Mock Co-opWinG',
+      servicePort: defaultBackendApiPort,
+      broadcastPort: 37020,
+      peerCount: _lanDiscoveryRunning ? _lanDiscoveryPeers().length : 0,
+    );
+  }
+
+  List<LanPeerDto> _lanDiscoveryPeers() {
+    return const [
+      LanPeerDto(
+        peerId: 'peer_mock_neighbor',
+        name: 'Mock Nearby Co-opWinG',
+        host: '192.168.1.23',
+        port: defaultBackendApiPort,
+        version: previewVersion,
+        lastSeenAgeSeconds: 1.1,
+      ),
+    ];
+  }
+
+  // ── v0.3-J Game Profile mock implementation ────────────────────────
+
+  final List<GameProfileDto> _gameProfiles = [];
+
+  @override
+  Future<GameProfileList> listGames() async {
+    await _mockDelay();
+    return List<GameProfileDto>.from(_gameProfiles);
+  }
+
+  @override
+  Future<GameProfileDto> createGame({
+    required String displayName,
+    required String executablePath,
+    String? workingDirectory,
+    List<String>? launchArgs,
+    String? notes,
+  }) async {
+    await _mockDelay();
+    final now = DateTime.now().millisecondsSinceEpoch.toDouble() / 1000.0;
+    final game = GameProfileDto(
+      gameId:
+          'mock_g_${_gameProfiles.length + 1}_${DateTime.now().millisecond}',
+      displayName: displayName,
+      executablePath: executablePath,
+      workingDirectory: workingDirectory,
+      launchArgs: launchArgs,
+      notes: notes,
+      createdAt: now,
+      updatedAt: now,
+    );
+    _gameProfiles.insert(0, game);
+    return game;
+  }
+
+  @override
+  Future<GameProfileDto> getGame(String gameId) async {
+    await _mockDelay();
+    final idx = _gameProfiles.indexWhere((g) => g.gameId == gameId);
+    if (idx < 0) {
+      throw const BackendError(
+        code: 'GAME_NOT_FOUND',
+        message: 'Game profile not found.',
+      );
+    }
+    return _gameProfiles[idx];
+  }
+
+  @override
+  Future<void> deleteGame(String gameId) async {
+    await _mockDelay();
+    _gameProfiles.removeWhere((g) => g.gameId == gameId);
+  }
+
+  @override
+  Future<ScanResultDto> scanGamePorts(
+    String gameId, {
+    String stage = 'manual',
+    int? processId,
+    bool includeLowConfidence = false,
+  }) async {
+    await _mockDelay();
+    final candidates = [
+      PortCandidateDto(
+        protocol: 'tcp',
+        port: 27015,
+        processId: 12345,
+        processName: 'hl2',
+        localAddress: '0.0.0.0',
+        confidence: 'high',
+        reason: 'TCP LISTEN on 0.0.0.0:27015',
+      ),
+      PortCandidateDto(
+        protocol: 'udp',
+        port: 27015,
+        processId: 12345,
+        processName: 'hl2',
+        localAddress: '0.0.0.0',
+        confidence: 'high',
+        reason: 'UDP bound 0.0.0.0:27015',
+      ),
+      PortCandidateDto(
+        protocol: 'tcp',
+        port: 27005,
+        processId: 12345,
+        processName: 'hl2',
+        localAddress: '127.0.0.1',
+        confidence: 'medium',
+        reason: 'TCP LISTEN on loopback 127.0.0.1:27005',
+      ),
+      PortCandidateDto(
+        protocol: 'udp',
+        port: 50000,
+        processId: 12345,
+        processName: 'hl2',
+        localAddress: '0.0.0.0',
+        confidence: 'low',
+        reason: 'ephemeral outbound port',
+      ),
+    ];
+    final scanResult = ScanResultDto(
+      candidates: candidates,
+      stage: stage,
+      scannedAt: DateTime.now().millisecondsSinceEpoch.toDouble() / 1000.0,
+      processName: 'hl2',
+      processId: 12345,
+    );
+    final idx = _gameProfiles.indexWhere((g) => g.gameId == gameId);
+    if (idx >= 0) {
+      _gameProfiles[idx] = GameProfileDto(
+        gameId: _gameProfiles[idx].gameId,
+        displayName: _gameProfiles[idx].displayName,
+        executablePath: _gameProfiles[idx].executablePath,
+        workingDirectory: _gameProfiles[idx].workingDirectory,
+        launchArgs: _gameProfiles[idx].launchArgs,
+        confirmedTcpPorts: _gameProfiles[idx].confirmedTcpPorts,
+        confirmedUdpPorts: _gameProfiles[idx].confirmedUdpPorts,
+        candidatePorts: candidates,
+        notes: _gameProfiles[idx].notes,
+        createdAt: _gameProfiles[idx].createdAt,
+        updatedAt: DateTime.now().millisecondsSinceEpoch.toDouble() / 1000.0,
+      );
+    }
+    return scanResult;
+  }
+
+  @override
+  Future<GameProfileDto> confirmGamePorts(
+    String gameId, {
+    required List<int> tcpPorts,
+    required List<int> udpPorts,
+  }) async {
+    await _mockDelay();
+    final idx = _gameProfiles.indexWhere((g) => g.gameId == gameId);
+    if (idx < 0) {
+      throw const BackendError(
+        code: 'GAME_NOT_FOUND',
+        message: 'Game profile not found.',
+      );
+    }
+    final updated = GameProfileDto(
+      gameId: _gameProfiles[idx].gameId,
+      displayName: _gameProfiles[idx].displayName,
+      executablePath: _gameProfiles[idx].executablePath,
+      workingDirectory: _gameProfiles[idx].workingDirectory,
+      launchArgs: _gameProfiles[idx].launchArgs,
+      confirmedTcpPorts: tcpPorts..sort(),
+      confirmedUdpPorts: udpPorts..sort(),
+      candidatePorts: _gameProfiles[idx].candidatePorts,
+      notes: _gameProfiles[idx].notes,
+      createdAt: _gameProfiles[idx].createdAt,
+      updatedAt: DateTime.now().millisecondsSinceEpoch.toDouble() / 1000.0,
+    );
+    _gameProfiles[idx] = updated;
+    return updated;
+  }
+
+  // ── helpers ─────────────────────────────────────────────────────────
 
   SessionInfo _findSession(String sessionId) {
     return _sessions.firstWhere(

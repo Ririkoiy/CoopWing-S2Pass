@@ -6,7 +6,6 @@ import 'models/app_event.dart';
 import 'models/app_settings.dart';
 import 'models/backend_health.dart';
 import 'models/doctor_report.dart';
-import 'models/game_profile.dart';
 import 'models/server_preset.dart';
 import 'screens/about_screen.dart';
 import 'screens/home_screen.dart';
@@ -19,8 +18,6 @@ import 'services/backend_process_manager.dart';
 import 'services/http_backend_client.dart';
 import 'services/mock_backend_client.dart';
 import 'services/localization.dart';
-import 'widgets/add_game_dialog.dart';
-import 'widgets/game_detail_dialog.dart';
 
 class S2PassPreviewApp extends StatelessWidget {
   const S2PassPreviewApp({super.key});
@@ -276,7 +273,6 @@ class _PreviewShellState extends State<_PreviewShell> {
   BackendHealth? _health;
   AppSettings? _settings;
   List<ServerPreset> _servers = [];
-  List<GameProfile> _profiles = [];
 
   bool get _developerMode => _settings?.developerMode ?? false;
 
@@ -330,7 +326,6 @@ class _PreviewShellState extends State<_PreviewShell> {
     final health = await _client.getHealth();
     final settings = await _client.getSettings();
     final servers = await _client.getServers();
-    final profiles = await _client.getProfiles();
     if (!mounted) {
       return;
     }
@@ -338,16 +333,8 @@ class _PreviewShellState extends State<_PreviewShell> {
       _health = health;
       _settings = settings;
       _servers = servers;
-      _profiles = profiles;
       _loading = false;
     });
-  }
-
-  Future<void> _refreshProfiles() async {
-    final profiles = await _client.getProfiles();
-    if (mounted) {
-      setState(() => _profiles = profiles);
-    }
   }
 
   Future<void> _refreshSettings() async {
@@ -359,39 +346,6 @@ class _PreviewShellState extends State<_PreviewShell> {
         _servers = servers;
       });
     }
-  }
-
-  Future<void> _showAddGame() async {
-    final saved = await showDialog<GameProfile>(
-      context: context,
-      builder: (context) => AddGameDialog(client: _client),
-    );
-    if (saved != null) {
-      await _refreshProfiles();
-      setState(() => _selectedIndex = 1);
-    }
-  }
-
-  Future<void> _showGameDetail(GameProfile profile) async {
-    await showDialog<bool>(
-      context: context,
-      builder: (context) => GameDetailDialog(
-        client: _client,
-        profile: profile,
-        developerMode: _developerMode,
-      ),
-    );
-    await _refreshProfiles();
-  }
-
-  Future<void> _launchGame(String profileId) async {
-    await _client.launchGame(profileId);
-    await _refreshProfiles();
-  }
-
-  Future<void> _stopGame(String profileId) async {
-    await _client.stopGame(profileId);
-    await _refreshProfiles();
   }
 
   Future<DoctorReport> _runDoctor() {
@@ -426,20 +380,7 @@ class _PreviewShellState extends State<_PreviewShell> {
         },
       ),
       // 1 My Games
-      MyGamesScreen(
-        profiles: _profiles,
-        onAddGame: _showAddGame,
-        onOpenProfile: _showGameDetail,
-        onLaunch: _launchGame,
-        onStop: _stopGame,
-        onRunDoctor: (_) => _runDoctor(),
-        onNavigateRoomConnection: (mode) {
-          setState(() {
-            _roomConnectionMode = mode;
-            _selectedIndex = 2;
-          });
-        },
-      ),
+      MyGamesScreen(client: _client),
       // 2 Room Connection
       RoomConnectionScreen(
         backendClient: _httpClient,

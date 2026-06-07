@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Co-opWinG v0.3-A1 LAN Discovery — pure stdlib UDP broadcast peer discovery.
+"""Co-opWinG v0.4 LAN Discovery — pure stdlib UDP broadcast peer discovery.
 
 This module is independent of the S2Pass protocol. It does NOT construct or
 consume protocol_lock.md message types, fields, or error codes.
@@ -85,7 +85,7 @@ class LanDiscoveryConfig:
     announce_interval_seconds: float = _DEFAULT_ANNOUNCE_INTERVAL
     peer_timeout_seconds: float = _DEFAULT_PEER_TIMEOUT
     product_name: str = "Co-opWinG"
-    version: str = "0.3-A1"
+    version: str = "0.4.0"
     instance_name: str = ""
 
 

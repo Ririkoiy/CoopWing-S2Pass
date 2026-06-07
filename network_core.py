@@ -13,7 +13,7 @@ import dataclasses
 import json
 import struct
 import time
-from typing import Optional, Callable, Dict, Any
+from typing import Optional, Callable, Dict, Any, List
 
 # ---------------------------------------------------------------------------
 # Constants from PROTOCOL_LOCK.md (frozen, do not modify)
@@ -36,8 +36,13 @@ _BAD_RELAY_IPS = {None, "", "0.0.0.0", "::", "127.0.0.1"}
 EVT_TCP_CONNECTED    = "TCP_CONNECTED"
 EVT_ROOM_CREATED     = "ROOM_CREATED"
 EVT_ROOM_JOINED      = "ROOM_JOINED"
+EVT_ROOM_UPDATED     = "ROOM_UPDATED"
 EVT_PEER_INFO        = "PEER_INFO"
 EVT_RELAY_ENABLED    = "RELAY_ENABLED"
+EVT_PARTICIPANT_JOINED = "PARTICIPANT_JOINED"
+EVT_PARTICIPANT_LEFT = "PARTICIPANT_LEFT"
+EVT_ROOM_READY       = "ROOM_READY"
+EVT_ROOM_CLOSED      = "ROOM_CLOSED"
 EVT_RELAY_FALLBACK   = "RELAY_FALLBACK"
 EVT_UDP_REG_SENT     = "UDP_REG_SENT"
 EVT_P2P_FAILED_SENT  = "P2P_FAILED_SENT"
@@ -71,6 +76,8 @@ class S2PassConfig:
     pps: int = 10
     duration: int = 10
     packet_size: int = 64
+    protocol_version: Optional[int] = None  # None/missing = v1 legacy
+    max_players: int = 4
     # UDP REG retry — old code sends 3 times, 0.05s apart (lines 421-423)
     udp_reg_count: int = 3
     udp_reg_interval: float = 0.05
@@ -139,6 +146,13 @@ class S2PassClientCore:
         # --- State (mirrors old CLIClient.__init__ L47-92) ---
         self.room_id: Optional[str] = None
         self.player_id: Optional[str] = None
+        self.protocol_version: Optional[int] = None
+        self.max_players: Optional[int] = None
+        self.participants: List[Dict[str, Any]] = []
+        self.participant_count: Optional[int] = None
+        self.host_player_id: Optional[str] = None
+        self.server_time: Optional[float] = None
+        self._last_room_update_signature: Optional[tuple] = None
 
         # TCP connection
         self._tcp_reader: Optional[asyncio.StreamReader] = None
@@ -242,18 +256,124 @@ class S2PassClientCore:
             except asyncio.QueueFull:
                 pass  # drop if queue full, avoid blocking
 
+    def event_room_created(
+        self,
+        participants: Optional[list],
+        room_id: Optional[str],
+        max_players: Optional[int],
+        protocol_version: Optional[int],
+        player_id: Optional[str] = None,
+    ) -> None:
+        data = {
+            "room_id": room_id,
+            "player_id": player_id,
+        }
+        if protocol_version is not None:
+            data["protocol_version"] = protocol_version
+        if max_players is not None:
+            data["max_players"] = max_players
+        if participants is not None:
+            data["participants"] = participants
+            data["participant_count"] = len(participants)
+        self._emit(EVT_ROOM_CREATED, f"room_id: {room_id}", data)
+
+    def event_room_joined(
+        self,
+        participants: Optional[list],
+        room_id: Optional[str],
+        player_id: Optional[str],
+        max_players: Optional[int],
+        protocol_version: Optional[int],
+    ) -> None:
+        data = {
+            "room_id": room_id,
+            "player_id": player_id,
+        }
+        if protocol_version is not None:
+            data["protocol_version"] = protocol_version
+        if max_players is not None:
+            data["max_players"] = max_players
+        if participants is not None:
+            data["participants"] = participants
+            data["participant_count"] = len(participants)
+        self._emit(EVT_ROOM_JOINED, f"player_id: {player_id}", data)
+
+    def event_room_updated(
+        self,
+        event: Optional[str],
+        participants: list,
+        participant_count: Optional[int],
+        max_players: Optional[int],
+        host_player_id: Optional[str],
+        room_id: Optional[str],
+        server_time: Optional[float],
+    ) -> None:
+        self._emit(EVT_ROOM_UPDATED, f"ROOM_UPDATED {event}", {
+            "event": event,
+            "participants": participants,
+            "participant_count": participant_count,
+            "max_players": max_players,
+            "host_player_id": host_player_id,
+            "room_id": room_id,
+            "server_time": server_time,
+        })
+
+    def event_relay_enabled(
+        self,
+        player_id: Optional[str],
+        relay_token: Optional[str],
+        relay_ip: Optional[str],
+        relay_port: Optional[int],
+    ) -> None:
+        self._emit(EVT_RELAY_ENABLED, "RELAY_ENABLED received", {
+            "player_id": player_id,
+            "relay_token": relay_token,
+            "relay_ip": relay_ip,
+            "relay_port": relay_port,
+            "relay_target_host": self._relay_target_host,
+            "relay_target_port": self._relay_target_port,
+        })
+
+    def event_participant_joined(self, player_id: str) -> None:
+        self._emit(EVT_PARTICIPANT_JOINED, f"participant_joined: {player_id}", {
+            "player_id": player_id,
+            "room_id": self.room_id,
+        })
+
+    def event_participant_left(self, player_id: str) -> None:
+        self._emit(EVT_PARTICIPANT_LEFT, f"participant_left: {player_id}", {
+            "player_id": player_id,
+            "room_id": self.room_id,
+        })
+
+    def event_room_ready(self, room_id: Optional[str]) -> None:
+        self._emit(EVT_ROOM_READY, f"room_ready: {room_id}", {
+            "room_id": room_id,
+        })
+
+    def event_room_closed(self, room_id: Optional[str]) -> None:
+        self._emit(EVT_ROOM_CLOSED, f"room_closed: {room_id}", {
+            "room_id": room_id,
+        })
+
     # ===================================================================
     # Protocol message builders (all JSON construction lives here)
     # ===================================================================
     def _build_create_room(self) -> str:
         """Build CREATE_ROOM envelope. (old L371-373)"""
         payload = {"player_name": self.config.player_name}
+        if self.config.protocol_version is not None:
+            payload["protocol_version"] = self.config.protocol_version
+            if self.config.protocol_version == 2:
+                payload["max_players"] = self.config.max_players
         envelope = {"type": "CREATE_ROOM", "payload": payload}
         return json.dumps(envelope, separators=(',', ':')) + '\n'
 
     def _build_join_room(self) -> str:
         """Build JOIN_ROOM envelope. (old L393-395)"""
         payload = {"room_id": self.room_id, "player_name": self.config.player_name}
+        if self.config.protocol_version is not None:
+            payload["protocol_version"] = self.config.protocol_version
         envelope = {"type": "JOIN_ROOM", "payload": payload}
         return json.dumps(envelope, separators=(',', ':')) + '\n'
 
@@ -442,6 +562,133 @@ class S2PassClientCore:
         except (ConnectionError, OSError) as e:
             self._emit(EVT_CONNECTION_LOST, f"TCP receive loop connection error: {e}")
 
+    @staticmethod
+    def _participant_ids(participants: list) -> List[str]:
+        ids: List[str] = []
+        for participant in participants:
+            if isinstance(participant, dict):
+                player_id = participant.get("player_id")
+                if isinstance(player_id, str):
+                    ids.append(player_id)
+        return ids
+
+    @staticmethod
+    def _room_update_signature(
+        event: Optional[str],
+        room_id: Optional[str],
+        participants: list,
+        participant_count: Optional[int],
+        server_time: Optional[float],
+    ) -> tuple:
+        return (
+            event,
+            room_id,
+            tuple(S2PassClientCore._participant_ids(participants)),
+            participant_count,
+            server_time,
+        )
+
+    def _remember_room_snapshot(
+        self,
+        participants: Optional[list],
+        room_id: Optional[str],
+        max_players: Optional[int],
+        protocol_version: Optional[int] = None,
+        participant_count: Optional[int] = None,
+        host_player_id: Optional[str] = None,
+        server_time: Optional[float] = None,
+    ) -> None:
+        if room_id is not None:
+            self.room_id = room_id
+        if protocol_version is not None:
+            self.protocol_version = protocol_version
+        if max_players is not None:
+            self.max_players = max_players
+        if participants is not None:
+            self.participants = participants
+            self.participant_count = (
+                participant_count
+                if participant_count is not None
+                else len(participants)
+            )
+        elif participant_count is not None:
+            self.participant_count = participant_count
+        if host_player_id is not None:
+            self.host_player_id = host_player_id
+        if server_time is not None:
+            self.server_time = server_time
+
+    def _handle_room_updated(self, payload: dict) -> None:
+        event = payload.get("event")
+        room_id = payload.get("room_id")
+        participants = payload.get("participants")
+        participant_count = payload.get("participant_count")
+        max_players = payload.get("max_players")
+        host_player_id = payload.get("host_player_id")
+        server_time = payload.get("server_time")
+
+        if not isinstance(event, str):
+            event = None
+        if not isinstance(room_id, str):
+            room_id = None
+        if not isinstance(participants, list):
+            participants = []
+        if not isinstance(participant_count, int):
+            participant_count = len(participants)
+        if not isinstance(max_players, int):
+            max_players = None
+        if not isinstance(host_player_id, str):
+            host_player_id = None
+        if isinstance(server_time, int):
+            server_time = float(server_time)
+        elif not isinstance(server_time, float):
+            server_time = None
+
+        signature = self._room_update_signature(
+            event, room_id, participants, participant_count, server_time
+        )
+        if signature == self._last_room_update_signature:
+            return
+        self._last_room_update_signature = signature
+
+        previous_ids = self._participant_ids(self.participants)
+        current_ids = self._participant_ids(participants)
+        joined_ids = [pid for pid in current_ids if pid not in previous_ids]
+        left_ids = [pid for pid in previous_ids if pid not in current_ids]
+
+        self._remember_room_snapshot(
+            participants,
+            room_id,
+            max_players,
+            protocol_version=2,
+            participant_count=participant_count,
+            host_player_id=host_player_id,
+            server_time=server_time,
+        )
+
+        self.event_room_updated(
+            event,
+            participants,
+            participant_count,
+            max_players,
+            host_player_id,
+            room_id,
+            server_time,
+        )
+
+        if event == "participant_joined":
+            if not joined_ids and current_ids:
+                joined_ids = [current_ids[-1]]
+            for player_id in joined_ids:
+                self.event_participant_joined(player_id)
+        elif event == "participant_left":
+            for player_id in left_ids:
+                self.event_participant_left(player_id)
+        elif event == "room_ready":
+            self.event_room_ready(room_id)
+        elif event == "room_closed":
+            self.event_room_closed(room_id)
+
     # ===================================================================
     # TCP message handler (old L218-272)
     # ===================================================================
@@ -449,18 +696,69 @@ class S2PassClientCore:
         if msg_type == "ROOM_CREATED":
             self.room_id = payload.get("room_id")
             self.player_id = payload.get("player_id")
-            self._emit(EVT_ROOM_CREATED, f"room_id: {self.room_id}", {
-                "room_id": self.room_id,
-                "player_id": self.player_id,
-            })
+            protocol_version = payload.get("protocol_version")
+            max_players = payload.get("max_players")
+            participants = payload.get("participants")
+            if not isinstance(protocol_version, int):
+                protocol_version = None
+            if not isinstance(max_players, int):
+                max_players = None
+            if not isinstance(participants, list):
+                participants = None
+            participant_count = payload.get("participant_count")
+            if not isinstance(participant_count, int):
+                participant_count = len(participants) if participants is not None else None
+            self._remember_room_snapshot(
+                participants,
+                self.room_id,
+                max_players,
+                protocol_version=protocol_version,
+                participant_count=participant_count,
+            )
+            self.event_room_created(
+                participants,
+                self.room_id,
+                max_players,
+                protocol_version,
+                player_id=self.player_id,
+            )
             self._room_created_event.set()
 
         elif msg_type == "ROOM_JOINED":
             self.player_id = payload.get("player_id")
-            self._emit(EVT_ROOM_JOINED, f"player_id: {self.player_id}", {
-                "player_id": self.player_id,
-            })
+            room_id = payload.get("room_id")
+            protocol_version = payload.get("protocol_version")
+            max_players = payload.get("max_players")
+            participants = payload.get("participants")
+            if not isinstance(room_id, str):
+                room_id = self.room_id
+            if not isinstance(protocol_version, int):
+                protocol_version = None
+            if not isinstance(max_players, int):
+                max_players = None
+            if not isinstance(participants, list):
+                participants = None
+            participant_count = payload.get("participant_count")
+            if not isinstance(participant_count, int):
+                participant_count = len(participants) if participants is not None else None
+            self._remember_room_snapshot(
+                participants,
+                room_id,
+                max_players,
+                protocol_version=protocol_version,
+                participant_count=participant_count,
+            )
+            self.event_room_joined(
+                participants,
+                room_id,
+                self.player_id,
+                max_players,
+                protocol_version,
+            )
             self._room_joined_event.set()
+
+        elif msg_type == "ROOM_UPDATED":
+            self._handle_room_updated(payload)
 
         elif msg_type == "PEER_INFO":
             self.peer_id = payload.get("peer_id")
@@ -505,13 +803,12 @@ class S2PassClientCore:
                 self._emit(EVT_RELAY_FALLBACK,
                            f"{fallback_reason}, falling back to {self.config.host}")
 
-            self._emit(EVT_RELAY_ENABLED, "RELAY_ENABLED received", {
-                "relay_token": self.relay_token,
-                "relay_ip": self.relay_ip,
-                "relay_port": self.relay_port,
-                "relay_target_host": self._relay_target_host,
-                "relay_target_port": self._relay_target_port,
-            })
+            self.event_relay_enabled(
+                self.player_id,
+                self.relay_token,
+                self.relay_ip,
+                self.relay_port,
+            )
             self._relay_enabled_event.set()
 
         elif msg_type == "HEARTBEAT":
@@ -737,22 +1034,23 @@ class S2PassClientCore:
             self._send_udp_register()
             await asyncio.sleep(self.config.udp_reg_interval)
 
-        # --- Step 5: Wait PEER_INFO (old L426-438) ---
-        lobby_timeout = self.config.lobby_timeout
-        if lobby_timeout == 0:
-            await self._peer_info_event.wait()
-        else:
-            try:
-                await asyncio.wait_for(
-                    self._peer_info_event.wait(), timeout=lobby_timeout
-                )
-            except asyncio.TimeoutError:
-                self._emit(EVT_TIMEOUT,
-                           f"PEER_INFO not received within {lobby_timeout}s")
+        # --- Step 5: Wait PEER_INFO for v1; v2 relay-only rooms skip it. ---
+        if self.protocol_version != 2:
+            lobby_timeout = self.config.lobby_timeout
+            if lobby_timeout == 0:
+                await self._peer_info_event.wait()
+            else:
+                try:
+                    await asyncio.wait_for(
+                        self._peer_info_event.wait(), timeout=lobby_timeout
+                    )
+                except asyncio.TimeoutError:
+                    self._emit(EVT_TIMEOUT,
+                               f"PEER_INFO not received within {lobby_timeout}s")
+                    return
+            if self.has_error:
+                self._emit(EVT_ERROR, "Error during PEER_INFO wait.")
                 return
-        if self.has_error:
-            self._emit(EVT_ERROR, "Error during PEER_INFO wait.")
-            return
 
         # --- Step 6: Wait RELAY_ENABLED (old L441-448) ---
         try:

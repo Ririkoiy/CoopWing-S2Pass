@@ -93,6 +93,7 @@ MSG_CREATE_ROOM:   str = "CREATE_ROOM"
 MSG_ROOM_CREATED:  str = "ROOM_CREATED"
 MSG_JOIN_ROOM:     str = "JOIN_ROOM"
 MSG_ROOM_JOINED:   str = "ROOM_JOINED"
+MSG_ROOM_UPDATED:  str = "ROOM_UPDATED"
 MSG_PEER_INFO:     str = "PEER_INFO"
 MSG_HEARTBEAT:     str = "HEARTBEAT"
 MSG_LEAVE_ROOM:    str = "LEAVE_ROOM"
@@ -104,7 +105,7 @@ MSG_ERROR:         str = "ERROR"
 # 合法消息类型集合（用于快速校验）
 _VALID_MSG_TYPES: frozenset = frozenset({
     MSG_CREATE_ROOM, MSG_ROOM_CREATED, MSG_JOIN_ROOM, MSG_ROOM_JOINED,
-    MSG_PEER_INFO, MSG_HEARTBEAT, MSG_LEAVE_ROOM,
+    MSG_ROOM_UPDATED, MSG_PEER_INFO, MSG_HEARTBEAT, MSG_LEAVE_ROOM,
     MSG_P2P_SUCCESS, MSG_P2P_FAILED, MSG_RELAY_ENABLED, MSG_ERROR,
 })
 
@@ -124,6 +125,8 @@ class ErrorCode(IntEnum):
     INVALID_TOKEN       = 1008
     PLAYER_NAME_INVALID = 1009
     DUPLICATE_ROOM      = 1010
+    UNSUPPORTED_PROTOCOL_VERSION = 1011
+    ROOM_LOCKED         = 1012
 
 # 错误码到人类可读消息的映射
 _ERROR_MESSAGES: Dict[int, str] = {
@@ -137,7 +140,20 @@ _ERROR_MESSAGES: Dict[int, str] = {
     1008: "Invalid token",
     1009: "Player name invalid",
     1010: "Duplicate room",
+    1011: "Unsupported protocol version",
+    1012: "Room locked",
 }
+
+PROTOCOL_VERSION_LEGACY: int = 1
+PROTOCOL_VERSION_V2:     int = 2
+SUPPORTED_PROTOCOL_VERSIONS: frozenset = frozenset({
+    PROTOCOL_VERSION_LEGACY,
+    PROTOCOL_VERSION_V2,
+})
+
+DEFAULT_MAX_PLAYERS: int = 4
+MIN_MAX_PLAYERS:     int = 2
+MAX_MAX_PLAYERS:     int = 8
 
 # ══════════════════════════════════════════════════════════════════════════════
 # 房间状态 — 冻结，禁止新增/重命名
@@ -344,16 +360,28 @@ class RelaySession:
 
 
 @dataclass
+class Participant:
+    """Server-local v2 participant snapshot."""
+    player_id:   str
+    player_name: str
+    is_host:     bool = False
+
+
+@dataclass
 class Room:
     """房间数据"""
     room_id:       str                                   # [A-Z0-9]{6}
     state:         str             = STATE_WAITING       # 状态机当前状态
     creator_id:    Optional[str]   = None                # 创建者 player_id
     joiner_id:     Optional[str]   = None                # 加入者 player_id
+    protocol_version: int          = PROTOCOL_VERSION_LEGACY
+    max_players:      int          = MIN_MAX_PLAYERS
+    participants: Dict[str, Participant] = field(default_factory=dict)
     created_at:    float           = 0.0                 # 创建时间 (monotonic)
     relay_session: Optional[RelaySession] = None         # Relay 会话
     punch_timeout_handle: Optional[asyncio.TimerHandle] = None  # 打洞超时句柄
     p2p_success_players: Set[str]  = field(default_factory=set) # 已报告 P2P_SUCCESS 的玩家
+    relay_enabled_players: Set[str] = field(default_factory=set)
     tasks:         list            = field(default_factory=list) # 关联的异步任务
 
 
@@ -630,6 +658,63 @@ def decode_message(line: bytes) -> Optional[Tuple[str, dict]]:
         return msg_type, payload
     except (UnicodeDecodeError, json.JSONDecodeError, AttributeError):
         return None
+
+
+def _parse_protocol_version(payload: dict) -> Optional[int]:
+    value = payload.get("protocol_version", PROTOCOL_VERSION_LEGACY)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value not in SUPPORTED_PROTOCOL_VERSIONS:
+        return None
+    return value
+
+
+def _parse_v2_max_players(payload: dict) -> Optional[int]:
+    value = payload.get("max_players", DEFAULT_MAX_PLAYERS)
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    if value < MIN_MAX_PLAYERS or value > MAX_MAX_PLAYERS:
+        return None
+    return value
+
+
+def _participant_snapshot(participant: Participant) -> dict:
+    return {
+        "player_id": participant.player_id,
+        "player_name": participant.player_name,
+        "is_host": participant.is_host,
+    }
+
+
+def _participants_snapshot(room: Room) -> list[dict]:
+    return [_participant_snapshot(participant) for participant in room.participants.values()]
+
+
+def _room_participant_count(room: Room) -> int:
+    return len(room.participants)
+
+
+def _build_v2_room_joined_payload(room: Room, player_id: str) -> dict:
+    return {
+        "room_id": room.room_id,
+        "player_id": player_id,
+        "protocol_version": PROTOCOL_VERSION_V2,
+        "max_players": room.max_players,
+        "participants": _participants_snapshot(room),
+        "participant_count": _room_participant_count(room),
+    }
+
+
+def _build_room_updated_payload(room: Room, event: str) -> dict:
+    return {
+        "room_id": room.room_id,
+        "event": event,
+        "participant_count": _room_participant_count(room),
+        "max_players": room.max_players,
+        "host_player_id": room.creator_id,
+        "participants": _participants_snapshot(room),
+        "server_time": time.time(),
+    }
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1005,6 +1090,21 @@ class P2PServer:
             await self._send_error(writer, ErrorCode.PLAYER_NAME_INVALID)
             return None
 
+        protocol_version = _parse_protocol_version(payload)
+        if protocol_version is None:
+            self._rate_limiter.remove_room(client_ip)
+            await self._send_error(writer, ErrorCode.UNSUPPORTED_PROTOCOL_VERSION)
+            return None
+
+        max_players = MIN_MAX_PLAYERS
+        if protocol_version == PROTOCOL_VERSION_V2:
+            parsed_max_players = _parse_v2_max_players(payload)
+            if parsed_max_players is None:
+                self._rate_limiter.remove_room(client_ip)
+                await self._send_error(writer, ErrorCode.INVALID_MESSAGE)
+                return None
+            max_players = parsed_max_players
+
         # ── 检查该连接是否已经有玩家 ──
         existing_pid = self._conn_to_player.get(conn_key)
         if existing_pid is not None:
@@ -1047,15 +1147,31 @@ class P2PServer:
             room_id=room_id,
             state=STATE_WAITING,
             creator_id=player_id,
+            protocol_version=protocol_version,
+            max_players=max_players,
             created_at=time.monotonic(),
         )
+        if protocol_version == PROTOCOL_VERSION_V2:
+            room.participants[player_id] = Participant(
+                player_id=player_id,
+                player_name=player_name,
+                is_host=True,
+            )
         self._rooms[room_id] = room
 
         # ── 返回 ROOM_CREATED ──
-        await self._send_message(writer, MSG_ROOM_CREATED, {
+        room_created_payload = {
             "room_id":   room_id,
             "player_id": player_id,
-        })
+        }
+        if protocol_version == PROTOCOL_VERSION_V2:
+            room_created_payload.update({
+                "protocol_version": PROTOCOL_VERSION_V2,
+                "max_players": max_players,
+                "participants": _participants_snapshot(room),
+                "participant_count": len(room.participants),
+            })
+        await self._send_message(writer, MSG_ROOM_CREATED, room_created_payload)
 
         logger.info("房间创建: %s (创建者: %s / %s)", room_id, player_name, player_id)
         return player_id
@@ -1086,16 +1202,37 @@ class P2PServer:
             await self._send_error(writer, ErrorCode.PLAYER_NAME_INVALID)
             return None
 
+        requested_protocol_version = _parse_protocol_version(payload)
+        if requested_protocol_version is None:
+            await self._send_error(writer, ErrorCode.UNSUPPORTED_PROTOCOL_VERSION)
+            return None
+
         # ── 检查房间是否存在 ──
         room = self._rooms.get(room_id)
         if room is None or room.state == STATE_CLOSED:
             await self._send_error(writer, ErrorCode.ROOM_NOT_FOUND)
             return None
 
-        # ── 检查房间是否已满 ──
-        if room.state != STATE_WAITING:
-            await self._send_error(writer, ErrorCode.ROOM_FULL)
+        is_v2_room = room.protocol_version == PROTOCOL_VERSION_V2
+        is_v2_client = requested_protocol_version == PROTOCOL_VERSION_V2
+
+        if is_v2_room and not is_v2_client:
+            await self._send_error(writer, ErrorCode.UNSUPPORTED_PROTOCOL_VERSION)
             return None
+
+        if is_v2_room:
+            if room.state not in (STATE_WAITING, STATE_READY, STATE_RELAY):
+                await self._send_error(writer, ErrorCode.ROOM_FULL)
+                return None
+            if _room_participant_count(room) >= room.max_players:
+                await self._send_error(writer, ErrorCode.ROOM_FULL)
+                return None
+        else:
+            # v1 legacy remains a 2-player WAITING -> READY path. A v2 client may
+            # join a v1 room, but receives protocol_version=1 and no v2 snapshot.
+            if room.state != STATE_WAITING:
+                await self._send_error(writer, ErrorCode.ROOM_FULL)
+                return None
 
         # ── 检查连接是否已有玩家在房间中 ──
         existing_pid = self._conn_to_player.get(conn_key)
@@ -1122,14 +1259,40 @@ class P2PServer:
         self._conn_to_player[conn_key] = player_id
 
         # ── 更新房间 ──
-        room.joiner_id = player_id
-        room.state = STATE_READY
+        if is_v2_room:
+            if room.joiner_id is None:
+                room.joiner_id = player_id
+            room.participants[player_id] = Participant(
+                player_id=player_id,
+                player_name=player_name,
+                is_host=False,
+            )
+            if _room_participant_count(room) >= 2 and room.state == STATE_WAITING:
+                room.state = STATE_READY
+        else:
+            room.joiner_id = player_id
+            room.state = STATE_READY
 
         # ── 返回 ROOM_JOINED ──
-        await self._send_message(writer, MSG_ROOM_JOINED, {
-            "room_id":   room_id,
-            "player_id": player_id,
-        })
+        if is_v2_room:
+            await self._send_message(
+                writer,
+                MSG_ROOM_JOINED,
+                _build_v2_room_joined_payload(room, player_id),
+            )
+            # E2 policy: broadcast participant_joined to all current participants,
+            # then additionally broadcast room_ready when the second participant joins.
+            await self._send_room_updated(room, "participant_joined")
+            if _room_participant_count(room) == 2 and room.state == STATE_READY:
+                await self._send_room_updated(room, "room_ready")
+        else:
+            room_joined_payload = {
+                "room_id":   room_id,
+                "player_id": player_id,
+            }
+            if is_v2_client:
+                room_joined_payload["protocol_version"] = PROTOCOL_VERSION_LEGACY
+            await self._send_message(writer, MSG_ROOM_JOINED, room_joined_payload)
 
         logger.info("玩家加入房间: %s -> %s (玩家: %s / %s)",
                      player_name, room_id, player_id, conn_key)
@@ -1137,6 +1300,90 @@ class P2PServer:
         # 状态进入 READY，等待双方 UDP 注册
         # PEER_INFO 将在双方 UDP 注册完成后发送
         return player_id
+
+    async def _send_room_updated(self, room: Room, event: str) -> None:
+        """Broadcast a v2 ROOM_UPDATED snapshot to all current participants."""
+        payload = _build_room_updated_payload(room, event)
+        for participant_id in list(room.participants.keys()):
+            player = self._players.get(participant_id)
+            if player is None or player.tcp_writer is None:
+                continue
+            await self._send_message(player.tcp_writer, MSG_ROOM_UPDATED, payload)
+
+    async def _cleanup_player(
+        self,
+        player_id: str,
+        *,
+        room: Optional[Room] = None,
+        close_writer: bool = True,
+    ) -> None:
+        """Remove one player and its TCP/UDP reverse indexes."""
+        player = self._players.pop(player_id, None)
+        if room is not None:
+            room.relay_enabled_players.discard(player_id)
+        if player is None:
+            return
+
+        if player.peer_addr:
+            self._conn_to_player.pop(player.peer_addr, None)
+        if player.udp_addr is not None:
+            self._udp_to_player.pop(player.udp_addr, None)
+        if player.tcp_ip:
+            self._rate_limiter.remove_room(player.tcp_ip)
+        if close_writer:
+            await self._close_tcp_writer(player.tcp_writer)
+
+    def _room_player_ids(self, room: Room) -> list[str]:
+        """Return every player id owned by this room."""
+        if room.protocol_version == PROTOCOL_VERSION_V2:
+            return list(room.participants.keys())
+        return [pid for pid in (room.creator_id, room.joiner_id) if pid is not None]
+
+    def _refresh_v2_joiner_id(self, room: Room) -> None:
+        """Keep the legacy joiner_id mirror usable after v2 departures."""
+        if room.protocol_version != PROTOCOL_VERSION_V2:
+            return
+        room.joiner_id = next(
+            (
+                participant_id
+                for participant_id in room.participants.keys()
+                if participant_id != room.creator_id
+            ),
+            None,
+        )
+
+    async def _handle_v2_participant_leave(
+        self,
+        room: Room,
+        player_id: str,
+        *,
+        reason: str,
+    ) -> None:
+        """Handle v2 explicit leave, TCP disconnect, or heartbeat timeout."""
+        if player_id not in room.participants:
+            await self._cleanup_player(player_id, room=room)
+            return
+
+        if player_id == room.creator_id:
+            await self._close_room(
+                room.room_id,
+                reason=reason,
+                notify_exclude_player_id=player_id,
+            )
+            return
+
+        room.participants.pop(player_id, None)
+        await self._cleanup_player(player_id, room=room)
+        self._refresh_v2_joiner_id(room)
+
+        remaining = _room_participant_count(room)
+        if remaining <= 0:
+            await self._close_room(room.room_id, reason=reason)
+            return
+
+        await self._send_room_updated(room, "participant_left")
+        if remaining < 2:
+            await self._close_room(room.room_id, reason=reason)
 
     async def _handle_heartbeat(
         self,
@@ -1179,6 +1426,15 @@ class P2PServer:
             return
 
         logger.info("玩家离开房间: %s from %s", player_id, room_id)
+        room = self._rooms.get(room_id)
+        if room is not None and room.protocol_version == PROTOCOL_VERSION_V2:
+            await self._handle_v2_participant_leave(
+                room,
+                player_id,
+                reason="Player left",
+            )
+            return
+
         await self._close_room(room_id, reason="Player left")
 
     async def _handle_p2p_success(
@@ -1295,9 +1551,21 @@ class P2PServer:
         logger.info("UDP 注册: %s -> %s:%d (房间 %s)",
                      player_id, addr[0], addr[1], room_id)
 
-        # ── 检查是否双方都已注册 → 推送 PEER_INFO ──
         room = self._rooms.get(room_id)
-        if room is None or room.state != STATE_READY:
+        if room is None:
+            return
+
+        if room.protocol_version == PROTOCOL_VERSION_V2:
+            if player_id not in room.participants:
+                return
+            if room.state == STATE_READY:
+                asyncio.ensure_future(self._maybe_enable_v2_relay(room))
+                return
+            if room.state == STATE_RELAY and room.relay_session is not None:
+                asyncio.ensure_future(self._send_v2_relay_enabled_once(room, player))
+            return
+
+        if room.state != STATE_READY:
             return
 
         creator = self._players.get(room.creator_id) if room.creator_id else None
@@ -1307,6 +1575,119 @@ class P2PServer:
                 joiner is not None and joiner.udp_addr is not None):
             # 双方 UDP 注册完成 → 发送 PEER_INFO，进入 PUNCHING
             asyncio.ensure_future(self._send_peer_info(room, creator, joiner))
+
+    def _v2_registered_participants(self, room: Room) -> list[Player]:
+        """Return v2 room participants with UDP REG, preserving join order."""
+        registered: list[Player] = []
+        for participant_id in room.participants.keys():
+            player = self._players.get(participant_id)
+            if player is not None and player.udp_addr is not None:
+                registered.append(player)
+        return registered
+
+    def _v2_relay_enabled_payload(self, room: Room) -> Optional[dict]:
+        """Build the locked RELAY_ENABLED payload for an active v2 room."""
+        if room.relay_session is None:
+            return None
+        return {
+            "room_id":     room.room_id,
+            "relay_ip":    self._public_ip,
+            "relay_port":  UDP_PORT,
+            "relay_token": room.relay_session.relay_token,
+        }
+
+    async def _send_v2_relay_enabled_once(self, room: Room, player: Player) -> bool:
+        """Send v2 RELAY_ENABLED to one participant at most once per room."""
+        if room.protocol_version != PROTOCOL_VERSION_V2:
+            return False
+        if player.player_id not in room.participants:
+            return False
+        if player.player_id in room.relay_enabled_players:
+            return False
+        if player.tcp_writer is None:
+            return False
+
+        relay_payload = self._v2_relay_enabled_payload(room)
+        if relay_payload is None:
+            return False
+
+        room.relay_enabled_players.add(player.player_id)
+        await self._send_message(player.tcp_writer, MSG_RELAY_ENABLED, relay_payload)
+        return True
+
+    async def _maybe_enable_v2_relay(self, room: Room) -> None:
+        """Activate a READY v2 room once at least two participants have UDP REG."""
+        if room.protocol_version != PROTOCOL_VERSION_V2:
+            return
+        if room.state != STATE_READY or room.relay_session is not None:
+            return
+
+        registered_players = self._v2_registered_participants(room)
+        if len(registered_players) < 2:
+            return
+
+        if len(self._relay_sessions) >= self._relay_max_sessions:
+            logger.warning(
+                "房间 %s v2 RELAY 启用失败: 全局 Relay 会话数超限 "
+                "(active=%d limit=%d)",
+                room.room_id,
+                len(self._relay_sessions),
+                self._relay_max_sessions,
+            )
+            for player in registered_players:
+                if player.tcp_writer:
+                    await self._send_error(player.tcp_writer, ErrorCode.RELAY_UNAVAILABLE)
+            return
+
+        relay_ips = tuple(dict.fromkeys(
+            player.tcp_ip or "" for player in registered_players
+        ))
+        reserved_ips: list[str] = []
+        for relay_ip in relay_ips:
+            if self._rate_limiter.add_relay(relay_ip):
+                reserved_ips.append(relay_ip)
+                continue
+            for reserved_ip in reserved_ips:
+                self._rate_limiter.remove_relay(reserved_ip)
+            logger.warning(
+                "房间 %s v2 RELAY 启用失败: IP %s Relay 会话数超限 (limit=%d)",
+                room.room_id,
+                relay_ip,
+                self._relay_max_sessions_per_ip,
+            )
+            for player in registered_players:
+                if player.tcp_writer:
+                    await self._send_error(player.tcp_writer, ErrorCode.RELAY_UNAVAILABLE)
+            return
+
+        relay_token = generate_relay_token()
+        now = time.monotonic()
+        relay_session = RelaySession(
+            relay_token=relay_token,
+            room_id=room.room_id,
+            player_a_id=registered_players[0].player_id,
+            player_b_id=registered_players[1].player_id,
+            created_at=now,
+            last_activity=now,
+            bandwidth_window_start=now,
+            bandwidth_tokens=float(self._relay_burst_bytes),
+            bandwidth_last_refill=now,
+            reserved_ips=tuple(reserved_ips),
+        )
+
+        room.relay_session = relay_session
+        room.state = STATE_RELAY
+        self._relay_sessions[relay_token] = relay_session
+
+        for player in registered_players:
+            await self._send_v2_relay_enabled_once(room, player)
+
+        logger.info(
+            "房间 %s v2 进入 RELAY 状态 (registered=%d token=%s)",
+            room.room_id,
+            len(registered_players),
+            relay_token,
+        )
 
     async def _send_peer_info(
         self,
@@ -1510,6 +1891,11 @@ class P2PServer:
                 self._rate_limiter.ban_ip(ip, IP_BAN_DURATION_TOKEN)
             return
 
+        room = self._rooms.get(session.room_id)
+        if room is not None and room.protocol_version == PROTOCOL_VERSION_V2:
+            self._handle_v2_udp_relay(session, room, data_bytes, newline_pos, player_id, ip)
+            return
+
         # ── Session-level diagnostics: received ──
         session.relay_packets_received += 1
         session.relay_bytes_received += len(data_bytes)
@@ -1612,11 +1998,117 @@ class P2PServer:
     # 房间关闭与资源清理
     # ══════════════════════════════════════════════════════════════════════
 
+    def _handle_v2_udp_relay(
+        self,
+        session: RelaySession,
+        room: Room,
+        data_bytes: bytes,
+        newline_pos: int,
+        player_id: str,
+        ip: str,
+    ) -> None:
+        """Fan out one v2 RELAY packet to other registered room participants."""
+        session.relay_packets_received += 1
+        session.relay_bytes_received += len(data_bytes)
+
+        sender = self._players.get(player_id)
+        if (
+                player_id not in room.participants or
+                sender is None or
+                sender.room_id != room.room_id):
+            session.relay_drop_player_mismatch += 1
+            return
+
+        now = time.monotonic()
+        game_data_len = len(data_bytes) - newline_pos - 1
+        is_whitelisted = self._rate_limiter._is_whitelist(ip)
+
+        if not is_whitelisted:
+            if now - session.pkt_window_start >= 1.0:
+                session.pkt_window_start = now
+                session.pkt_count = 0
+
+            session.pkt_count += 1
+            if session.pkt_count > RELAY_RATE_LIMIT:
+                session.dropped_packets += 1
+                session.relay_drop_rate_limit_exceeded += 1
+                rl_logger.warning(
+                    f"relay_pkt_{session.relay_token}",
+                    "Relay packet rate limit exceeded, dropping payload "
+                    "(token=%s packet_limit=%d dropped_packets=%d)",
+                    session.relay_token,
+                    RELAY_RATE_LIMIT,
+                    session.dropped_packets,
+                )
+                return
+
+            elapsed = max(0.0, now - session.bandwidth_last_refill)
+            session.bandwidth_tokens = min(
+                float(self._relay_burst_bytes),
+                session.bandwidth_tokens + elapsed * self._relay_bytes_per_second,
+            )
+            session.bandwidth_last_refill = now
+            if game_data_len > session.bandwidth_tokens:
+                session.dropped_packets += 1
+                session.dropped_bytes += game_data_len
+                session.relay_drop_bandwidth_exceeded += 1
+                rl_logger.warning(
+                    f"relay_bw_{session.relay_token}",
+                    "Relay bandwidth limit exceeded, dropping payload "
+                    "(token=%s payload_bytes=%d available_bytes=%d "
+                    "bytes_per_second=%d burst_bytes=%d "
+                    "dropped_packets=%d dropped_bytes=%d)",
+                    session.relay_token,
+                    game_data_len,
+                    int(session.bandwidth_tokens),
+                    self._relay_bytes_per_second,
+                    self._relay_burst_bytes,
+                    session.dropped_packets,
+                    session.dropped_bytes,
+                )
+                return
+            session.bandwidth_tokens -= game_data_len
+
+        if now - session.bandwidth_window_start >= 1.0:
+            session.bandwidth_window_start = now
+            session.bandwidth_bytes = 0
+        session.bandwidth_bytes += game_data_len
+        session.last_activity = now
+
+        if self._udp_transport is None:
+            session.relay_drop_no_udp_transport += 1
+            return
+
+        forward_data = b"RELAY\n" + data_bytes
+        forwarded = 0
+        missing_targets = 0
+
+        for participant_id in room.participants.keys():
+            if participant_id == player_id:
+                continue
+            target_player = self._players.get(participant_id)
+            if target_player is None or target_player.udp_addr is None:
+                missing_targets += 1
+                continue
+            try:
+                self._udp_transport.sendto(forward_data, target_player.udp_addr)
+                forwarded += 1
+                session.relay_packets_forwarded += 1
+                session.relay_bytes_forwarded += len(forward_data)
+            except OSError:
+                session.relay_forward_exceptions += 1
+
+        if forwarded == 0:
+            session.relay_drop_no_target_udp_addr += max(1, missing_targets)
+        elif missing_targets:
+            session.relay_drop_no_target_udp_addr += missing_targets
+
     async def _close_room(
         self,
         room_id: str,
         reason: str = "",
         error_code: ErrorCode = ErrorCode.ROOM_NOT_FOUND,
+        notify_exclude_player_id: Optional[str] = None,
     ) -> None:
         """
         关闭房间 — 幂等清理所有关联资源
@@ -1640,6 +2132,7 @@ class P2PServer:
             return
 
         old_state = room.state
+        player_ids = self._room_player_ids(room)
         room.state = STATE_CLOSED
         logger.info("房间关闭: %s (原状态: %s, 原因: %s)", room_id, old_state, reason)
 
@@ -1655,9 +2148,7 @@ class P2PServer:
             reserved_ips = room.relay_session.reserved_ips
             if not reserved_ips:
                 fallback_ips: list[str] = []
-                for pid in (room.creator_id, room.joiner_id):
-                    if pid is None:
-                        continue
+                for pid in player_ids:
                     p = self._players.get(pid)
                     if p is not None and p.tcp_ip:
                         fallback_ips.append(p.tcp_ip)
@@ -1667,35 +2158,36 @@ class P2PServer:
 
             room.relay_session = None
 
+        room_closed_payload = None
+        if room.protocol_version == PROTOCOL_VERSION_V2:
+            room_closed_payload = _build_room_updated_payload(room, "room_closed")
+
         # 3. 清理玩家 — 统一清理路径
-        for pid in (room.creator_id, room.joiner_id):
-            if pid is None:
-                continue
-            player = self._players.pop(pid, None)
+        for pid in player_ids:
+            player = self._players.get(pid)
             if player is None:
+                room.relay_enabled_players.discard(pid)
                 continue
 
             # 通知玩家（在关闭 writer 之前）
             if player.tcp_writer is not None and not player.tcp_writer.is_closing():
                 try:
-                    await self._send_error(player.tcp_writer, error_code)
+                    if room_closed_payload is not None:
+                        if pid != notify_exclude_player_id:
+                            await self._send_message(
+                                player.tcp_writer,
+                                MSG_ROOM_UPDATED,
+                                room_closed_payload,
+                            )
+                    else:
+                        await self._send_error(player.tcp_writer, error_code)
                 except Exception:
                     pass
 
-            # 清理 conn_to_player 反向索引
-            if player.peer_addr:
-                self._conn_to_player.pop(player.peer_addr, None)
+            await self._cleanup_player(pid, room=room)
 
-            # 清理 UDP 反向索引
-            if player.udp_addr is not None:
-                self._udp_to_player.pop(player.udp_addr, None)
-
-            # 归还 IP 房间计数
-            if player.tcp_ip:
-                self._rate_limiter.remove_room(player.tcp_ip)
-
-            # 关闭 TCP writer
-            await self._close_tcp_writer(player.tcp_writer)
+        room.participants.clear()
+        room.relay_enabled_players.clear()
 
         # 4. 取消关联任务
         for task in room.tasks:
@@ -1730,8 +2222,16 @@ class P2PServer:
         logger.info("TCP 断开 (隐式 LEAVE): %s from %s", player_id, conn_key)
 
         if room_id is not None:
-            # 有房间 — 通过 _close_room 统一清理 (房间 + 双方玩家)
-            await self._close_room(room_id, reason="TCP disconnected")
+            room = self._rooms.get(room_id)
+            if room is not None and room.protocol_version == PROTOCOL_VERSION_V2:
+                await self._handle_v2_participant_leave(
+                    room,
+                    player_id,
+                    reason="TCP disconnected",
+                )
+            else:
+                # 有房间 — 通过 _close_room 统一清理 (房间 + 双方玩家)
+                await self._close_room(room_id, reason="TCP disconnected")
         else:
             # 无房间的玩家 — 直接清理
             self._players.pop(player_id, None)
@@ -1751,22 +2251,32 @@ class P2PServer:
                 now = time.monotonic()
 
                 # ── 1. 心跳超时检测 ──
-                timed_out_rooms: set = set()
+                timed_out_rooms: set[str] = set()
+                timed_out_players: list[tuple[str, str]] = []
 
                 for pid, player in list(self._players.items()):
                     if player.last_heartbeat > 0:
                         if now - player.last_heartbeat > HEARTBEAT_TIMEOUT:
                             logger.info("心跳超时: %s (房间: %s)", pid, player.room_id)
                             if player.room_id is not None:
-                                timed_out_rooms.add(player.room_id)
+                                room = self._rooms.get(player.room_id)
+                                if room is not None and room.protocol_version == PROTOCOL_VERSION_V2:
+                                    timed_out_players.append((pid, player.room_id))
+                                else:
+                                    timed_out_rooms.add(player.room_id)
                             else:
                                 # 无房间的玩家超时 — 直接清理
-                                self._players.pop(pid, None)
-                                if player.peer_addr:
-                                    self._conn_to_player.pop(player.peer_addr, None)
-                                if player.udp_addr is not None:
-                                    self._udp_to_player.pop(player.udp_addr, None)
-                                await self._close_tcp_writer(player.tcp_writer)
+                                await self._cleanup_player(pid)
+
+                for pid, room_id in timed_out_players:
+                    room = self._rooms.get(room_id)
+                    if room is None:
+                        continue
+                    await self._handle_v2_participant_leave(
+                        room,
+                        pid,
+                        reason="Heartbeat timeout",
+                    )
 
                 for room_id in timed_out_rooms:
                     await self._close_room(

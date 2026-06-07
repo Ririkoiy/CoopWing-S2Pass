@@ -11,7 +11,7 @@ import '../services/localization.dart';
 
 enum _SessionMode { create, join }
 
-enum _AdapterMode { off, udpExperimental, tcpRelay, tcpForward }
+enum _AdapterMode { bundle, udpOnly, tcpOnly }
 
 class BackendBridgePanel extends StatefulWidget {
   const BackendBridgePanel({
@@ -69,8 +69,17 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       TextEditingController(text: BackendBridgePanel.defaultGameBindHost);
   final TextEditingController _adapterTargetPortController =
       TextEditingController();
+  final TextEditingController _secondaryIpController = TextEditingController();
+  final TextEditingController _secondaryIpInterfaceController =
+      TextEditingController();
+  final TextEditingController _secondaryIpPrefixController =
+      TextEditingController(text: '24');
+  final TextEditingController _pidController = TextEditingController();
 
   HealthStatus _health = HealthStatus.offline();
+  LanDiscoveryStatus _lanDiscoveryStatus = LanDiscoveryStatus.stopped();
+  List<LanPeerDto> _lanDiscoveryPeers = const [];
+  SecondaryIpRecommendation? _secondaryIpRecommendation;
   SessionInfo? _session;
   List<SessionEvent> _events = const [];
   BackendError? _error;
@@ -79,8 +88,14 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
   final AdapterTrafficRateCalculator _trafficRateCalculator =
       AdapterTrafficRateCalculator();
   _SessionMode _mode = _SessionMode.create;
-  _AdapterMode _adapterMode = _AdapterMode.udpExperimental;
+  _AdapterMode _adapterMode = _AdapterMode.bundle;
   bool _forceRelay = true;
+  bool _secondaryIpEnabledForNextSession = false;
+  Map<String, dynamic>? _secondaryIpStatus;
+  List<ProcessPortCandidate> _processPortCandidates = const [];
+  ProcessPortCandidate? _selectedProcessPortCandidate;
+  String? _processPortHint;
+  int _roomTabIndex = 0;
   bool _busy = false;
   bool _pollingSession = false;
   Timer? _sessionPollTimer;
@@ -94,6 +109,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       'starting' ||
       'room_created' ||
       'room_joined' ||
+      'room_ready' ||
       'relay_ready' ||
       'running' => true,
       _ => false,
@@ -102,17 +118,19 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
 
   bool get _hasPlayerName => _playerNameController.text.trim().isNotEmpty;
 
-  bool get _hasGameServerPort =>
-      _gameServerPortController.text.trim().isNotEmpty;
-
   bool get _hasRoomId => _roomController.text.trim().isNotEmpty;
+
+  bool get _hasValidGamePort {
+    final port = int.tryParse(_gameServerPortController.text.trim());
+    return port != null && port >= 1 && port <= 65535;
+  }
 
   bool get _canCreate =>
       !_busy &&
       _backendOnline &&
       !_sessionStatusIsActive &&
       _hasPlayerName &&
-      _hasGameServerPort;
+      _hasValidGamePort;
 
   bool get _canJoin =>
       !_busy &&
@@ -184,6 +202,10 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     _gameServerPortController.dispose();
     _adapterTargetHostController.dispose();
     _adapterTargetPortController.dispose();
+    _secondaryIpController.dispose();
+    _secondaryIpInterfaceController.dispose();
+    _secondaryIpPrefixController.dispose();
+    _pidController.dispose();
     _sessionPollTimer?.cancel();
     _healthRetryTimer?.cancel();
     super.dispose();
@@ -212,52 +234,8 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
               busy: _busy,
               onRefresh: () => _checkHealth(),
             ),
-            const SizedBox(height: 16),
-            if (_sessionStatusIsActive && session != null)
-              _ActiveSessionCard(
-                session: session,
-                health: _health,
-                canStop: _canStop,
-                onStop: _stopSession,
-                onReset: _confirmResetDisplay,
-                onCopyRoomId: _copyRoomId,
-                onCopyAdapterBind: _copyAdapterBind,
-                onCopyAdapterTarget: _copyAdapterTarget,
-                onCopyRelayRoot: _copyRelayRoot,
-                trafficRate: _trafficRate,
-              )
-            else ...[
-              _ModeSelector(
-                mode: _mode,
-                enabled: !_busy,
-                onChanged: (mode) => setState(() => _mode = mode),
-              ),
-              const SizedBox(height: 12),
-              _ModeForm(
-                mode: _mode,
-                playerNameController: _playerNameController,
-                gameServerPortController: _gameServerPortController,
-                roomController: _roomController,
-                forceRelay: _forceRelay,
-                forceRelayEnabled: !_busy,
-                onForceRelayChanged: (value) {
-                  setState(() => _forceRelay = value);
-                },
-                canCreate: _canCreate,
-                canJoin: _canJoin,
-                onCreate: _createSession,
-                onJoin: _joinSession,
-              ),
-            ],
-            if (!_backendOnline) ...[
-              const SizedBox(height: 10),
-              Text(
-                loc.get('backend_offline_note'),
-                style: TextStyle(fontSize: 12, color: scheme.error),
-              ),
-            ],
             if (_pendingActionText != null) ...[
-              const SizedBox(height: 12),
+              const SizedBox(height: 10),
               Row(
                 children: [
                   const SizedBox(
@@ -274,8 +252,136 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
               ),
             ],
             if (_error != null) ...[
-              const SizedBox(height: 14),
+              const SizedBox(height: 10),
               _ErrorBanner(error: _error!),
+            ],
+            const SizedBox(height: 10),
+            // ---- Tab row ----
+            Row(
+              children: [
+                _TabChip(
+                  label: loc.get('roomTabLabel'),
+                  selected: _roomTabIndex == 0,
+                  onTap: () => setState(() => _roomTabIndex = 0),
+                ),
+                const SizedBox(width: 8),
+                _TabChip(
+                  label: loc.get('advancedTabLabel'),
+                  selected: _roomTabIndex == 1,
+                  onTap: () => setState(() => _roomTabIndex = 1),
+                ),
+              ],
+            ),
+            const SizedBox(height: 14),
+            // ---- Tab content ----
+            if (_roomTabIndex == 0) ...[
+              // ═══ ROOM TAB ═══
+              if (_sessionStatusIsActive && session != null)
+                _ActiveSessionCard(
+                  session: session,
+                  health: _health,
+                  canStop: _canStop,
+                  onStop: _stopSession,
+                  onReset: _confirmResetDisplay,
+                  onCopyRoomId: _copyRoomId,
+                  onCopyAdapterBind: _copyAdapterBind,
+                  onCopyAdapterTarget: _copyAdapterTarget,
+                  onCopyRelayRoot: _copyRelayRoot,
+                  trafficRate: _trafficRate,
+                )
+              else ...[
+                _ModeSelector(
+                  mode: _mode,
+                  enabled: !_busy,
+                  onChanged: (mode) => setState(() => _mode = mode),
+                ),
+                const SizedBox(height: 12),
+                _ModeForm(
+                  mode: _mode,
+                  playerNameController: _playerNameController,
+                  gameServerPortController: _gameServerPortController,
+                  roomController: _roomController,
+                  forceRelay: _forceRelay,
+                  forceRelayEnabled: !_busy,
+                  onForceRelayChanged: (value) {
+                    setState(() => _forceRelay = value);
+                  },
+                  canCreate: _canCreate,
+                  canJoin: _canJoin,
+                  onCreate: _createSession,
+                  onJoin: _joinSession,
+                ),
+              ],
+              if (!_backendOnline) ...[
+                const SizedBox(height: 10),
+                Text(
+                  loc.get('backend_offline_note'),
+                  style: TextStyle(fontSize: 12, color: scheme.error),
+                ),
+              ],
+            ] else ...[
+              _PidPortDetectionSection(
+                pidController: _pidController,
+                candidates: _processPortCandidates,
+                selectedCandidate: _selectedProcessPortCandidate,
+                hint: _processPortHint,
+                controlsEnabled:
+                    _backendOnline && !_busy && !_sessionStatusIsActive,
+                onScan: _scanProcessPorts,
+                onSelected: (candidate) {
+                  setState(() {
+                    _selectedProcessPortCandidate = candidate;
+                    _processPortHint = null;
+                  });
+                },
+                onApply: _applySelectedProcessPort,
+              ),
+              const SizedBox(height: 14),
+              // ═══ ADVANCED TAB ═══
+              _LanDiscoverySection(
+                status: _lanDiscoveryStatus,
+                peers: _lanDiscoveryPeers,
+                backendOnline: _backendOnline,
+                busy: _busy,
+                onStart: _startLanDiscovery,
+                onStop: _stopLanDiscovery,
+                onRefreshPeers: _refreshLanDiscoveryPeers,
+              ),
+              const SizedBox(height: 14),
+              _SecondaryIpSetupCard(
+                health: _health,
+                recommendation: _secondaryIpRecommendation,
+                session: session,
+                backendApiAddress:
+                    '${_backendHostController.text.trim()}:${_backendPortController.text.trim()}',
+                armedForNextSession: _secondaryIpEnabledForNextSession,
+                controlsEnabled: !_busy && !_sessionStatusIsActive,
+                onAutoSelect: _backendOnline ? _autoSelectSecondaryIp : null,
+                onEnable: _backendOnline
+                    ? _enableSecondaryIpForNextSession
+                    : null,
+                onRelease: (_backendOnline) ? _releaseSecondaryIp : null,
+                secondaryIpStatus: _secondaryIpStatus,
+              ),
+              const SizedBox(height: 14),
+              _AdvancedBackendSettingsSection(
+                backendHostController: _backendHostController,
+                backendPortController: _backendPortController,
+                serverHostController: _serverHostController,
+                serverPortController: _serverPortController,
+                serverUdpPortController: _serverUdpPortController,
+                gameServerHostController: _gameServerHostController,
+                gameServerPortController: _gameServerPortController,
+                adapterTargetHostController: _adapterTargetHostController,
+                secondaryIpController: _secondaryIpController,
+                secondaryIpInterfaceController: _secondaryIpInterfaceController,
+                secondaryIpPrefixController: _secondaryIpPrefixController,
+                adapterMode: _adapterMode,
+                onAdapterModeChanged: (mode) {
+                  setState(() => _adapterMode = mode);
+                },
+                controlsEnabled: !_busy && !_sessionStatusIsActive,
+              ),
             ],
           ],
         ),
@@ -343,27 +449,6 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
             ),
           ),
         ),
-        const SizedBox(height: 12),
-        Card(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 8),
-            child: _AdvancedBackendSettingsSection(
-              backendHostController: _backendHostController,
-              backendPortController: _backendPortController,
-              serverHostController: _serverHostController,
-              serverPortController: _serverPortController,
-              serverUdpPortController: _serverUdpPortController,
-              gameServerHostController: _gameServerHostController,
-              gameServerPortController: _gameServerPortController,
-              adapterTargetHostController: _adapterTargetHostController,
-              adapterMode: _adapterMode,
-              onAdapterModeChanged: (mode) {
-                setState(() => _adapterMode = mode);
-              },
-              controlsEnabled: !_busy && !_sessionStatusIsActive,
-            ),
-          ),
-        ),
       ],
     );
   }
@@ -377,6 +462,10 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       _health = await widget.client.health();
       if (_health.isOnline && _error?.code == 'BACKEND_OFFLINE') {
         _error = null;
+      }
+      if (_health.isOnline) {
+        await _refreshLanDiscoveryStatusSnapshot();
+        await _refreshSecondaryIpRecommendationSnapshot();
       }
     }, requireOnline: false);
   }
@@ -402,6 +491,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
           session,
           await widget.client.getSessionLogs(session.sessionId),
         );
+        _secondaryIpEnabledForNextSession = false;
       } on BackendError catch (error) {
         throw _actionError('Create room failed', error);
       }
@@ -414,6 +504,14 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
         final playerName = _parsePlayerName();
         final roomId = _parseRequiredRoomId();
         final gameServerHost = _normalizedGameHost();
+        AdapterConfig? adapterConfig;
+        if (_hasValidGamePort) {
+          final localGamePort = int.parse(
+            _gameServerPortController.text.trim(),
+          );
+          _adapterTargetPortController.text = localGamePort.toString();
+          adapterConfig = _adapterConfigOrNull(includeTargetPort: true);
+        }
 
         final session = await widget.client.joinSession(
           serverHost: _serverHostController.text.trim(),
@@ -423,12 +521,13 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
           playerName: playerName,
           gameServerHost: gameServerHost,
           forceRelay: _forceRelay,
-          adapterConfig: _adapterConfigOrNull(includeTargetPort: false),
+          adapterConfig: adapterConfig,
         );
         _applySessionSnapshot(
           session,
           await widget.client.getSessionLogs(session.sessionId),
         );
+        _secondaryIpEnabledForNextSession = false;
       } on BackendError catch (error) {
         throw _actionError('Join room failed', error);
       }
@@ -460,6 +559,115 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
         await widget.client.getSessionLogs(session.sessionId),
       );
     }, pendingText: Localization().get('stopping_session'));
+  }
+
+  Future<void> _startLanDiscovery() async {
+    await _run(() async {
+      _lanDiscoveryStatus = await widget.client.startLanDiscovery();
+      await _refreshLanDiscoveryPeersSnapshot();
+    }, pendingText: Localization().get('lan_discovery_starting'));
+  }
+
+  Future<void> _stopLanDiscovery() async {
+    await _run(() async {
+      _lanDiscoveryStatus = await widget.client.stopLanDiscovery();
+      _lanDiscoveryPeers = const [];
+    }, pendingText: Localization().get('lan_discovery_stopping'));
+  }
+
+  Future<void> _refreshLanDiscoveryPeers() async {
+    await _run(() async {
+      await _refreshLanDiscoveryPeersSnapshot();
+    }, pendingText: Localization().get('lan_discovery_refreshing_peers'));
+  }
+
+  Future<void> _scanProcessPorts() async {
+    final pid = int.tryParse(_pidController.text.trim());
+    if (pid == null || pid <= 0) {
+      setState(() {
+        _processPortCandidates = const [];
+        _selectedProcessPortCandidate = null;
+        _processPortHint = Localization().get('pid_port_invalid_pid');
+      });
+      return;
+    }
+    await _run(() async {
+      final result = await widget.client.scanProcessPorts(pid);
+      _processPortCandidates = result.candidates;
+      _selectedProcessPortCandidate = result.candidates.isEmpty
+          ? null
+          : result.candidates.first;
+      _processPortHint = result.candidates.isEmpty
+          ? Localization().get('pid_port_no_candidates')
+          : null;
+    }, pendingText: Localization().get('pid_port_scanning'));
+  }
+
+  void _applySelectedProcessPort() {
+    final candidate = _selectedProcessPortCandidate;
+    if (candidate == null) return;
+    final loc = Localization();
+    if (_adapterMode == _AdapterMode.udpOnly &&
+        candidate.protocol.toLowerCase() != 'udp') {
+      setState(() {
+        _processPortHint = loc.get('pid_port_udp_mismatch');
+      });
+      return;
+    }
+    if (_adapterMode == _AdapterMode.tcpOnly &&
+        candidate.protocol.toLowerCase() != 'tcp') {
+      setState(() {
+        _processPortHint = loc.get('pid_port_tcp_mismatch');
+      });
+      return;
+    }
+
+    setState(() {
+      final port = candidate.localPort.toString();
+      _gameServerPortController.text = port;
+      _adapterTargetPortController.text = port;
+      _processPortHint = switch (_adapterMode) {
+        _AdapterMode.bundle => loc.get('pid_port_applied_bundle'),
+        _AdapterMode.udpOnly => loc.get('pid_port_applied_udp'),
+        _AdapterMode.tcpOnly => loc.get('pid_port_applied_tcp'),
+      };
+    });
+  }
+
+  Future<void> _autoSelectSecondaryIp() async {
+    await _run(() async {
+      await _refreshSecondaryIpRecommendationSnapshot();
+      _applyRecommendedSecondaryIp();
+      _secondaryIpEnabledForNextSession = false;
+    }, pendingText: Localization().get('secondaryIpAutoSelecting'));
+  }
+
+  void _enableSecondaryIpForNextSession() {
+    final loc = Localization();
+    setState(() {
+      _error = null;
+      if (_secondaryIpController.text.trim().isEmpty) {
+        _applyRecommendedSecondaryIp();
+      }
+      if (_secondaryIpController.text.trim().isEmpty) {
+        _error = const BackendError(
+          code: 'INVALID_INPUT',
+          message: 'secondaryIpNoRecommendation',
+        );
+        _secondaryIpEnabledForNextSession = false;
+        return;
+      }
+      _secondaryIpEnabledForNextSession = true;
+      _pendingActionText = loc.get('secondaryIpEnabledForNextSession');
+    });
+    Future<void>.delayed(const Duration(milliseconds: 700), () {
+      if (!mounted) return;
+      setState(() {
+        if (_pendingActionText == loc.get('secondaryIpEnabledForNextSession')) {
+          _pendingActionText = null;
+        }
+      });
+    });
   }
 
   Future<void> _copyRoomId() async {
@@ -592,6 +800,90 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     final status = await widget.client.getSessionStatus(sessionId);
     final events = await widget.client.getSessionLogs(sessionId);
     _applySessionSnapshot(status, events);
+  }
+
+  Future<void> _refreshLanDiscoveryStatusSnapshot() async {
+    _lanDiscoveryStatus = await widget.client.getLanDiscoveryStatus();
+    if (!_lanDiscoveryStatus.running) {
+      _lanDiscoveryPeers = const [];
+    }
+  }
+
+  Future<void> _refreshLanDiscoveryPeersSnapshot() async {
+    final response = await widget.client.getLanDiscoveryPeers();
+    _lanDiscoveryPeers = response.peers;
+    if (!response.running && _lanDiscoveryStatus.running) {
+      await _refreshLanDiscoveryStatusSnapshot();
+    }
+  }
+
+  Future<void> _refreshSecondaryIpRecommendationSnapshot() async {
+    try {
+      _secondaryIpRecommendation = await widget.client
+          .getSecondaryIpRecommendation();
+    } on BackendError {
+      rethrow;
+    } catch (error) {
+      _secondaryIpRecommendation = SecondaryIpRecommendation.unavailable(
+        backendAdmin: _health.backendAdmin,
+        reason: 'recommendation_failed',
+        warning: error.toString(),
+      );
+    }
+  }
+
+  void _applyRecommendedSecondaryIp() {
+    final recommendation = _secondaryIpRecommendation;
+    if (recommendation == null || !recommendation.available) return;
+    final recommendedIp = recommendation.recommendedIp;
+    if (recommendedIp == null || recommendedIp.isEmpty) return;
+    _secondaryIpController.text = recommendedIp;
+    final interfaceIndex = recommendation.interfaceIndex;
+    if (interfaceIndex != null) {
+      _secondaryIpInterfaceController.text = interfaceIndex.toString();
+    }
+    final prefixLength = recommendation.prefixLength;
+    if (prefixLength != null) {
+      _secondaryIpPrefixController.text = prefixLength.toString();
+    }
+  }
+
+  Future<void> _refreshSecondaryIpStatusSnapshot() async {
+    if (!_backendOnline) return;
+    try {
+      _secondaryIpStatus = await widget.client.getSecondaryIpStatus();
+    } catch (_) {
+      _secondaryIpStatus = null;
+    }
+  }
+
+  Future<void> _releaseSecondaryIp() async {
+    if (_busy) return;
+    setState(() {
+      _busy = true;
+      _pendingActionText = Localization().get('secondaryIpReleasing');
+    });
+    try {
+      await widget.client.releaseSecondaryIp();
+      await _refreshSecondaryIpStatusSnapshot();
+      await _refreshSecondaryIpRecommendationSnapshot();
+    } on BackendError catch (error) {
+      setState(() {
+        _error = error;
+      });
+    } catch (error) {
+      setState(() {
+        _error = BackendError(
+          code: 'RELEASE_FAILED',
+          message: error.toString(),
+        );
+      });
+    } finally {
+      setState(() {
+        _busy = false;
+        _pendingActionText = null;
+      });
+    }
   }
 
   Future<void> _pollSessionSnapshot() async {
@@ -748,6 +1040,28 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       stats: session.stats,
       adapterStatus: session.adapterStatus,
       error: session.error,
+      playerId: session.playerId,
+      protocolVersion: session.protocolVersion,
+      maxPlayers: session.maxPlayers,
+      participantCount: session.participantCount,
+      participants: session.participants,
+      hostPlayerId: session.hostPlayerId,
+      lastRoomEvent: session.lastRoomEvent,
+      roomReady: session.roomReady,
+      roomClosed: session.roomClosed,
+      relayReady: session.relayReady,
+      relayTokenAvailable: session.relayTokenAvailable,
+      relayTargetHost: session.relayTargetHost,
+      relayTargetPort: session.relayTargetPort,
+      serverTime: session.serverTime,
+      secondaryIpEnabled: session.secondaryIpEnabled,
+      secondaryIpFallbackUsed: session.secondaryIpFallbackUsed,
+      secondaryIpWarning: session.secondaryIpWarning,
+      backendAdmin: session.backendAdmin,
+      secondaryIpBindAddress: session.secondaryIpBindAddress,
+      secondaryIpInterfaceIndex: session.secondaryIpInterfaceIndex,
+      secondaryIpInterfaceAlias: session.secondaryIpInterfaceAlias,
+      adapterBindMode: session.adapterBindMode,
     );
   }
 
@@ -831,9 +1145,34 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     return parsed;
   }
 
+  int? _parseSecondaryIpPrefix() {
+    final text = _secondaryIpPrefixController.text.trim();
+    if (text.isEmpty) return null;
+    final parsed = int.tryParse(text);
+    if (parsed == null || parsed < 1 || parsed > 32) {
+      throw const BackendError(
+        code: 'INVALID_INPUT',
+        message: 'invalid_secondary_ip_prefix',
+      );
+    }
+    return parsed;
+  }
+
+  SecondaryIpRequestConfig? _secondaryIpRequestOrNull() {
+    if (!_secondaryIpEnabledForNextSession) return null;
+    final ip = _secondaryIpController.text.trim();
+    if (ip.isEmpty) return null;
+    final interfaceHint = _secondaryIpInterfaceController.text.trim();
+    return SecondaryIpRequestConfig(
+      ipAddress: ip,
+      interfaceHint: interfaceHint.isEmpty ? null : interfaceHint,
+      prefixLength: _parseSecondaryIpPrefix(),
+    );
+  }
+
   AdapterConfig? _adapterConfigOrNull({required bool includeTargetPort}) {
-    if (_adapterMode == _AdapterMode.off) return null;
     final targetHost = _normalizedAdapterTargetHost();
+    final secondaryIpRequest = _secondaryIpRequestOrNull();
     int? targetPort;
     if (includeTargetPort) {
       final portText = _adapterTargetPortController.text.trim();
@@ -844,19 +1183,21 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       _adapterTargetPortController.text = targetPort.toString();
     }
     return switch (_adapterMode) {
-      _AdapterMode.udpExperimental => AdapterConfig.udpExperimental(
+      _AdapterMode.bundle => AdapterConfig.bundle(
+        targetHost: targetHost,
+        targetPort: targetPort!,
+        secondaryIpRequest: secondaryIpRequest,
+      ),
+      _AdapterMode.udpOnly => AdapterConfig.udpExperimental(
         targetHost: targetHost,
         targetPort: targetPort,
+        secondaryIpRequest: secondaryIpRequest,
       ),
-      _AdapterMode.tcpRelay => AdapterConfig.tcpRelay(
+      _AdapterMode.tcpOnly => AdapterConfig.tcpForward(
         targetHost: targetHost,
         targetPort: targetPort,
+        secondaryIpRequest: secondaryIpRequest,
       ),
-      _AdapterMode.tcpForward => AdapterConfig.tcpForward(
-        targetHost: targetHost,
-        targetPort: targetPort,
-      ),
-      _AdapterMode.off => null,
     };
   }
 
@@ -1019,6 +1360,7 @@ class _ModeForm extends StatelessWidget {
           const SizedBox(height: 12),
           if (isCreate)
             Wrap(
+              key: const Key('create-basic-fields'),
               spacing: 10,
               runSpacing: 10,
               children: [
@@ -1033,30 +1375,37 @@ class _ModeForm extends StatelessWidget {
                 SizedBox(
                   width: _fieldWidth,
                   child: _Field(
+                    key: const Key('create-game-port-field'),
                     controller: gameServerPortController,
-                    label: loc.get('game_server_port'),
-                    hintText: loc.get('game_server_port_hint'),
+                    label: loc.get('shared_game_port'),
                     number: true,
+                    helperText: loc.get('game_server_port_hint'),
                   ),
                 ),
               ],
             )
           else ...[
-            SizedBox(
-              width: 360,
-              child: _Field(
-                controller: playerNameController,
-                label: loc.get('player_name'),
-                hintText: loc.get('player_name_hint'),
-              ),
-            ),
-            const SizedBox(height: 10),
-            SizedBox(
-              width: 240,
-              child: _Field(
-                controller: roomController,
-                label: loc.get('room_id'),
-              ),
+            Wrap(
+              spacing: 10,
+              runSpacing: 10,
+              children: [
+                SizedBox(
+                  width: _fieldWidth,
+                  child: _Field(
+                    controller: playerNameController,
+                    label: loc.get('player_name'),
+                    hintText: loc.get('player_name_hint'),
+                  ),
+                ),
+                SizedBox(
+                  width: _fieldWidth,
+                  child: _Field(
+                    key: const Key('join-room-id-field'),
+                    controller: roomController,
+                    label: loc.get('room_id'),
+                  ),
+                ),
+              ],
             ),
           ],
           const SizedBox(height: 12),
@@ -1226,6 +1575,14 @@ class _ActiveSessionCard extends StatelessWidget {
                 ),
             ],
           ),
+          if (_hasV2SessionInfo(session)) ...[
+            const SizedBox(height: 10),
+            _SessionV2Details(session: session),
+          ],
+          if (_hasSecondaryIpInfo(session)) ...[
+            const SizedBox(height: 10),
+            _SecondaryIpDetails(session: session),
+          ],
           if (adapterStatus != null) ...[
             const SizedBox(height: 10),
             _AdapterStatusDetails(
@@ -1351,6 +1708,14 @@ class _SessionSummary extends StatelessWidget {
                 ),
             ],
           ),
+          if (_hasV2SessionInfo(session)) ...[
+            const SizedBox(height: 10),
+            _SessionV2Details(session: session),
+          ],
+          if (_hasSecondaryIpInfo(session)) ...[
+            const SizedBox(height: 10),
+            _SecondaryIpDetails(session: session),
+          ],
           if (adapterBind != null) ...[
             const SizedBox(height: 10),
             _HighlightDatum(
@@ -1410,6 +1775,381 @@ class _SessionSummary extends StatelessWidget {
       ),
     );
   }
+}
+
+class _SessionV2Details extends StatelessWidget {
+  const _SessionV2Details({required this.session});
+
+  final SessionInfo session;
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final participants = session.participants;
+    final relayTarget = _relayTargetValue(session);
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Wrap(
+          spacing: 10,
+          runSpacing: 10,
+          children: [
+            if (session.protocolVersion != null)
+              _Datum(
+                label: loc.get('protocolVersionLabel'),
+                value: _protocolLabel(session.protocolVersion!),
+              ),
+            if (_playersValue(session) != null)
+              _Datum(
+                label: loc.get('playersLabel'),
+                value: _playersValue(session)!,
+              ),
+            _Datum(
+              label: loc.get('roomReadyLabel'),
+              value: _yesNo(session.roomReady),
+            ),
+            _Datum(
+              label: loc.get('roomClosedLabel'),
+              value: _yesNo(session.roomClosed),
+            ),
+            _Datum(
+              label: loc.get('relayReadyLabel'),
+              value: _yesNo(session.relayReady),
+            ),
+            if (session.lastRoomEvent != null)
+              _Datum(
+                label: loc.get('lastRoomEventLabel'),
+                value: session.lastRoomEvent!,
+              ),
+            if (relayTarget != null)
+              _Datum(label: loc.get('relayTargetLabel'), value: relayTarget),
+          ],
+        ),
+        const SizedBox(height: 12),
+        Text(
+          loc.get('participantsLabel'),
+          style: Theme.of(context).textTheme.titleSmall,
+        ),
+        const SizedBox(height: 8),
+        if (participants.isEmpty)
+          _HelperText(text: loc.get('noParticipantsLabel'))
+        else
+          Column(
+            children: participants
+                .map(
+                  (participant) => _ParticipantRow(
+                    participant: participant,
+                    currentPlayerId: session.playerId,
+                    hostPlayerId: session.hostPlayerId,
+                  ),
+                )
+                .toList(growable: false),
+          ),
+      ],
+    );
+  }
+}
+
+class _ParticipantRow extends StatelessWidget {
+  const _ParticipantRow({
+    required this.participant,
+    required this.currentPlayerId,
+    required this.hostPlayerId,
+  });
+
+  final ParticipantDto participant;
+  final String? currentPlayerId;
+  final String? hostPlayerId;
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final scheme = Theme.of(context).colorScheme;
+    final isHost = participant.isHost || participant.playerId == hostPlayerId;
+    final isCurrent =
+        currentPlayerId != null && participant.playerId == currentPlayerId;
+    final title = participant.playerName.isNotEmpty
+        ? participant.playerName
+        : (participant.playerId.isNotEmpty ? participant.playerId : '-');
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        border: Border.all(color: scheme.outlineVariant),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Wrap(
+        spacing: 8,
+        runSpacing: 6,
+        crossAxisAlignment: WrapCrossAlignment.center,
+        children: [
+          Text(title, style: Theme.of(context).textTheme.bodyMedium),
+          if (isHost)
+            Chip(
+              label: Text(loc.get('hostLabel')),
+              visualDensity: VisualDensity.compact,
+            ),
+          if (isCurrent)
+            Chip(
+              label: Text(loc.get('youLabel')),
+              visualDensity: VisualDensity.compact,
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SecondaryIpDetails extends StatelessWidget {
+  const _SecondaryIpDetails({required this.session});
+
+  final SessionInfo session;
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final interfaceValue = _secondaryIpInterfaceValue(session);
+    final gameTarget =
+        _adapterTargetAddress(session.adapterStatus) ??
+        (session.gameServerPort == null
+            ? '-'
+            : '${session.gameServerHost}:${session.gameServerPort}');
+    return Wrap(
+      spacing: 10,
+      runSpacing: 10,
+      children: [
+        _Datum(
+          label: loc.get('backendAdminLabel'),
+          value: _yesNo(session.backendAdmin),
+        ),
+        _Datum(
+          label: loc.get('secondaryIpBindStatusLabel'),
+          value: _secondaryIpBindStatusLabel(session),
+        ),
+        _Datum(
+          label: loc.get('secondaryIpTargetInterfaceLabel'),
+          value: interfaceValue,
+        ),
+        _Datum(
+          label: loc.get('secondaryIpBindAddressLabel'),
+          value: session.secondaryIpBindAddress ?? '-',
+        ),
+        _Datum(
+          label: loc.get('adapterBindModeLabel'),
+          value: session.adapterBindMode,
+        ),
+        _Datum(label: loc.get('gameTargetAddressLabel'), value: gameTarget),
+        if (session.secondaryIpWarning != null &&
+            session.secondaryIpWarning!.isNotEmpty)
+          _Datum(
+            label: loc.get('secondaryIpWarningLabel'),
+            value: session.secondaryIpWarning!,
+          ),
+      ],
+    );
+  }
+}
+
+class _SecondaryIpSetupCard extends StatelessWidget {
+  const _SecondaryIpSetupCard({
+    required this.health,
+    required this.recommendation,
+    required this.session,
+    required this.backendApiAddress,
+    required this.armedForNextSession,
+    required this.controlsEnabled,
+    required this.onAutoSelect,
+    required this.onEnable,
+    this.onRelease,
+    this.secondaryIpStatus,
+  });
+
+  final HealthStatus health;
+  final SecondaryIpRecommendation? recommendation;
+  final SessionInfo? session;
+  final String backendApiAddress;
+  final bool armedForNextSession;
+  final bool controlsEnabled;
+  final VoidCallback? onAutoSelect;
+  final VoidCallback? onEnable;
+  final VoidCallback? onRelease;
+  final Map<String, dynamic>? secondaryIpStatus;
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final scheme = Theme.of(context).colorScheme;
+    final rec = recommendation;
+    final activeSession = session;
+    final sipStatus = secondaryIpStatus;
+    final interfaceValue = _recommendationInterfaceValue(rec);
+    final recommendedIp = rec?.recommendedIp ?? '-';
+    final adapterBind =
+        activeSession?.secondaryIpBindAddress ??
+        _adapterBindAddress(activeSession?.adapterStatus) ??
+        '-';
+    final allocated = sipStatus?['allocated'] == true;
+    final allocatedIp = sipStatus?['allocated_ip'] as String?;
+    final bindMode = sipStatus?['bind_mode'] as String? ?? '-';
+    final source = sipStatus?['source'] as String? ?? '-';
+    final lastError = sipStatus?['last_error'] as String?;
+
+    final statusLabel = allocated
+        ? loc.get('secondaryIpAllocatedStatus')
+        : (activeSession == null
+              ? (armedForNextSession
+                    ? loc.get('secondaryIpReadyToRequest')
+                    : loc.get('secondaryIpNotRequested'))
+              : _secondaryIpBindStatusLabel(activeSession));
+    final warning =
+        lastError ?? activeSession?.secondaryIpWarning ?? rec?.warning;
+
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        border: Border.all(color: scheme.outlineVariant),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.add_link, color: scheme.primary),
+              const SizedBox(width: 8),
+              Text(
+                loc.get('secondaryIpCardTitle'),
+                style: Theme.of(context).textTheme.titleMedium,
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          _HelperText(text: loc.get('secondaryIpSafetyNote')),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _Datum(
+                label: loc.get('backendAdminLabel'),
+                value: _yesNo(rec?.backendAdmin ?? health.backendAdmin),
+              ),
+              _Datum(
+                label: loc.get('secondaryIpDefaultInterfaceLabel'),
+                value: interfaceValue,
+              ),
+              _Datum(
+                label: loc.get('recommendedAddressLabel'),
+                value: recommendedIp,
+              ),
+              _Datum(
+                label: loc.get('secondaryIpBindStatusLabel'),
+                value: statusLabel,
+              ),
+              if (allocated && allocatedIp != null) ...[
+                _Datum(
+                  label: loc.get('secondaryIpAllocatedAddressLabel'),
+                  value: allocatedIp,
+                ),
+                _Datum(label: loc.get('adapterBindModeLabel'), value: bindMode),
+                _Datum(label: loc.get('secondaryIpSourceLabel'), value: source),
+              ],
+              _Datum(
+                label: loc.get('backendApiAddressLabel'),
+                value: backendApiAddress,
+              ),
+              _Datum(label: loc.get('label_adapter_bind'), value: adapterBind),
+              if (activeSession?.secondaryIpBindAddress != null)
+                _Datum(
+                  label: loc.get('adapterBindModeLabel'),
+                  value: activeSession!.adapterBindMode,
+                ),
+              if (warning != null && warning.isNotEmpty)
+                _Datum(
+                  label: loc.get('secondaryIpWarningLabel'),
+                  value: warning,
+                ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              if (allocated)
+                OutlinedButton.icon(
+                  onPressed: controlsEnabled ? onRelease : null,
+                  icon: const Icon(Icons.link_off),
+                  label: Text(loc.get('releaseSecondaryIpButton')),
+                )
+              else ...[
+                OutlinedButton.icon(
+                  onPressed: controlsEnabled ? onAutoSelect : null,
+                  icon: const Icon(Icons.route_outlined),
+                  label: Text(loc.get('autoSelectInterfaceButton')),
+                ),
+                FilledButton.icon(
+                  onPressed: controlsEnabled ? onEnable : null,
+                  icon: const Icon(Icons.add_circle_outline),
+                  label: Text(loc.get('enableSecondaryIpButton')),
+                ),
+              ],
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+String _recommendationInterfaceValue(
+  SecondaryIpRecommendation? recommendation,
+) {
+  if (recommendation == null || !recommendation.available) return '-';
+  final alias = recommendation.interfaceAlias;
+  final index = recommendation.interfaceIndex;
+  final ip = recommendation.interfaceIp;
+  final prefix = recommendation.prefixLength;
+  final String name;
+  if ((alias == null || alias.isEmpty) && index == null) {
+    name = '-';
+  } else if (alias == null || alias.isEmpty) {
+    name = 'ifIndex $index';
+  } else if (index == null) {
+    name = alias;
+  } else {
+    name = '$alias (ifIndex $index)';
+  }
+  if (ip == null || prefix == null) return name;
+  return '$name $ip/$prefix';
+}
+
+String _secondaryIpBindStatusLabel(SessionInfo session) {
+  final loc = Localization();
+  if (session.secondaryIpEnabled) {
+    return loc.get('secondaryIpAssigned');
+  }
+  if (session.secondaryIpFallbackUsed ||
+      (session.secondaryIpWarning?.isNotEmpty ?? false)) {
+    return loc.get('secondaryIpFailed');
+  }
+  return loc.get('secondaryIpDisabled');
+}
+
+String _secondaryIpInterfaceValue(SessionInfo session) {
+  final alias = session.secondaryIpInterfaceAlias;
+  final index = session.secondaryIpInterfaceIndex;
+  if ((alias == null || alias.isEmpty) && index == null) {
+    return '-';
+  }
+  if (alias == null || alias.isEmpty) {
+    return 'ifIndex $index';
+  }
+  if (index == null) {
+    return alias;
+  }
+  return '$alias (ifIndex $index)';
 }
 
 class _AdapterStatusDetails extends StatelessWidget {
@@ -1577,6 +2317,64 @@ String _formatTrafficRate(double packetsPerSecond, double? kilobytesPerSecond) {
   return '$packetText, ${kilobytesPerSecond.toStringAsFixed(1)} KB/s';
 }
 
+String _formatLastSeenAge(num seconds) {
+  final safeSeconds = seconds < 0 ? 0 : seconds;
+  if (safeSeconds < 10) {
+    return '${safeSeconds.toStringAsFixed(1)}s ago';
+  }
+  return '${safeSeconds.round()}s ago';
+}
+
+bool _hasV2SessionInfo(SessionInfo session) {
+  return session.protocolVersion != null ||
+      session.maxPlayers != null ||
+      session.participantCount != null ||
+      session.participants.isNotEmpty ||
+      session.hostPlayerId != null ||
+      session.lastRoomEvent != null ||
+      session.roomReady ||
+      session.roomClosed ||
+      session.relayReady ||
+      session.relayTargetHost != null ||
+      session.relayTargetPort != null;
+}
+
+bool _hasSecondaryIpInfo(SessionInfo session) {
+  return session.secondaryIpEnabled ||
+      session.secondaryIpFallbackUsed ||
+      (session.secondaryIpWarning != null &&
+          session.secondaryIpWarning!.isNotEmpty);
+}
+
+String _protocolLabel(int version) {
+  final loc = Localization();
+  if (version == 2) {
+    return 'v2 ${loc.get('relayOnlyLabel')}';
+  }
+  return 'v$version';
+}
+
+String? _playersValue(SessionInfo session) {
+  final count = session.participantCount ?? session.participants.length;
+  final maxPlayers = session.maxPlayers;
+  if (count == 0 && maxPlayers == null) return null;
+  if (maxPlayers == null) return '$count';
+  return '$count / $maxPlayers';
+}
+
+String? _relayTargetValue(SessionInfo session) {
+  final host = session.relayTargetHost;
+  final port = session.relayTargetPort;
+  if (host == null || host.isEmpty || port == null || port <= 0) {
+    return null;
+  }
+  return '$host:$port';
+}
+
+String _yesNo(bool value) {
+  return Localization().get(value ? 'yesLabel' : 'noLabel');
+}
+
 class _HighlightDatum extends StatelessWidget {
   const _HighlightDatum({
     required this.label,
@@ -1649,6 +2447,194 @@ class _HelperText extends StatelessWidget {
   }
 }
 
+class _LanDiscoverySection extends StatelessWidget {
+  const _LanDiscoverySection({
+    required this.status,
+    required this.peers,
+    required this.backendOnline,
+    required this.busy,
+    required this.onStart,
+    required this.onStop,
+    required this.onRefreshPeers,
+  });
+
+  final LanDiscoveryStatus status;
+  final List<LanPeerDto> peers;
+  final bool backendOnline;
+  final bool busy;
+  final VoidCallback onStart;
+  final VoidCallback onStop;
+  final VoidCallback onRefreshPeers;
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final running = status.running;
+    return Material(
+      color: Colors.transparent,
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          Row(
+            children: [
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Text(
+                      loc.get('lan_discovery_title'),
+                      style: Theme.of(context).textTheme.titleMedium,
+                    ),
+                    const SizedBox(height: 4),
+                    _HelperText(text: loc.get('lan_discovery_note')),
+                  ],
+                ),
+              ),
+              const SizedBox(width: 12),
+              Chip(
+                avatar: Icon(
+                  Icons.circle,
+                  size: 10,
+                  color: running ? Colors.teal : Colors.redAccent,
+                ),
+                label: Text(
+                  running
+                      ? loc.get('lan_discovery_running')
+                      : loc.get('lan_discovery_stopped'),
+                ),
+                visualDensity: VisualDensity.compact,
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _Datum(
+                label: loc.get('label_status'),
+                value: running
+                    ? loc.get('lan_discovery_running')
+                    : loc.get('lan_discovery_stopped'),
+              ),
+              if (running && (status.peerId?.isNotEmpty ?? false))
+                _Datum(
+                  label: loc.get('lan_discovery_local_peer_id'),
+                  value: status.peerId!,
+                ),
+              _Datum(
+                label: loc.get('lan_discovery_instance_name'),
+                value: status.instanceName.isEmpty ? '-' : status.instanceName,
+              ),
+              _Datum(
+                label: loc.get('lan_discovery_service_port'),
+                value: status.servicePort > 0 ? '${status.servicePort}' : '-',
+              ),
+              _Datum(
+                label: loc.get('lan_discovery_broadcast_port'),
+                value: status.broadcastPort > 0
+                    ? '${status.broadcastPort}'
+                    : '-',
+              ),
+              _Datum(
+                label: loc.get('lan_discovery_peer_count'),
+                value: '${status.peerCount}',
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              FilledButton.icon(
+                onPressed: backendOnline && !busy && !running ? onStart : null,
+                icon: const Icon(Icons.wifi_tethering),
+                label: Text(loc.get('lan_discovery_start')),
+              ),
+              OutlinedButton.icon(
+                onPressed: backendOnline && !busy && running ? onStop : null,
+                icon: const Icon(Icons.stop_circle_outlined),
+                label: Text(loc.get('lan_discovery_stop')),
+              ),
+              OutlinedButton.icon(
+                onPressed: backendOnline && !busy ? onRefreshPeers : null,
+                icon: const Icon(Icons.sync),
+                label: Text(loc.get('lan_discovery_refresh_peers')),
+              ),
+            ],
+          ),
+          const SizedBox(height: 12),
+          Text(
+            loc.get('lan_discovery_peers'),
+            style: Theme.of(context).textTheme.titleSmall,
+          ),
+          const SizedBox(height: 8),
+          if (peers.isEmpty)
+            _HelperText(text: loc.get('lan_discovery_no_peers'))
+          else
+            Column(
+              children: peers
+                  .map((peer) => _LanPeerRow(peer: peer))
+                  .toList(growable: false),
+            ),
+        ],
+      ),
+    );
+  }
+}
+
+class _LanPeerRow extends StatelessWidget {
+  const _LanPeerRow({required this.peer});
+
+  final LanPeerDto peer;
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final scheme = Theme.of(context).colorScheme;
+    final title = peer.name.isEmpty ? peer.host : peer.name;
+    final address = '${peer.host}:${peer.port}';
+    return Container(
+      width: double.infinity,
+      margin: const EdgeInsets.only(bottom: 8),
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        border: Border.all(color: scheme.outlineVariant),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(title, style: Theme.of(context).textTheme.titleSmall),
+          const SizedBox(height: 6),
+          Wrap(
+            spacing: 10,
+            runSpacing: 6,
+            children: [
+              Text(address),
+              Text('${loc.get('version')}: ${peer.version}'),
+              Text(
+                '${loc.get('lan_discovery_last_seen')}: '
+                '${_formatLastSeenAge(peer.lastSeenAgeSeconds)}',
+              ),
+            ],
+          ),
+          if (peer.peerId.isNotEmpty) ...[
+            const SizedBox(height: 6),
+            SelectableText(
+              'peer_id: ${peer.peerId}',
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 class _LogsDetailsSection extends StatelessWidget {
   const _LogsDetailsSection({
     required this.health,
@@ -1686,6 +2672,10 @@ class _LogsDetailsSection extends StatelessWidget {
                     ? '${health.backend} / ${health.mode}'
                     : loc.get('backend_health_offline'),
               ),
+              _Datum(
+                label: loc.get('backendAdminLabel'),
+                value: _yesNo(health.backendAdmin),
+              ),
             ],
           ),
           const SizedBox(height: 12),
@@ -1713,6 +2703,156 @@ class _LogsDetailsSection extends StatelessWidget {
   }
 }
 
+class _PidPortDetectionSection extends StatelessWidget {
+  const _PidPortDetectionSection({
+    required this.pidController,
+    required this.candidates,
+    required this.selectedCandidate,
+    required this.hint,
+    required this.controlsEnabled,
+    required this.onScan,
+    required this.onSelected,
+    required this.onApply,
+  });
+
+  final TextEditingController pidController;
+  final List<ProcessPortCandidate> candidates;
+  final ProcessPortCandidate? selectedCandidate;
+  final String? hint;
+  final bool controlsEnabled;
+  final VoidCallback onScan;
+  final ValueChanged<ProcessPortCandidate> onSelected;
+  final VoidCallback onApply;
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        border: Border.all(color: scheme.outlineVariant),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Text(
+            loc.get('pid_port_title'),
+            style: Theme.of(context).textTheme.titleMedium,
+          ),
+          const SizedBox(height: 4),
+          Text(
+            loc.get('pid_port_note'),
+            style: Theme.of(
+              context,
+            ).textTheme.bodySmall?.copyWith(color: scheme.onSurfaceVariant),
+          ),
+          const SizedBox(height: 12),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            crossAxisAlignment: WrapCrossAlignment.center,
+            children: [
+              SizedBox(
+                width: 180,
+                child: _Field(
+                  controller: pidController,
+                  label: loc.get('pid_port_pid'),
+                  number: true,
+                  enabled: controlsEnabled,
+                ),
+              ),
+              FilledButton.icon(
+                onPressed: controlsEnabled ? onScan : null,
+                icon: const Icon(Icons.search),
+                label: Text(loc.get('pid_port_scan')),
+              ),
+              OutlinedButton.icon(
+                onPressed: controlsEnabled && selectedCandidate != null
+                    ? onApply
+                    : null,
+                icon: const Icon(Icons.check),
+                label: Text(loc.get('pid_port_apply')),
+              ),
+            ],
+          ),
+          if (candidates.isNotEmpty) ...[
+            const SizedBox(height: 12),
+            ...candidates.map(
+              (candidate) => Padding(
+                padding: const EdgeInsets.only(bottom: 8),
+                child: InkWell(
+                  onTap: controlsEnabled ? () => onSelected(candidate) : null,
+                  borderRadius: BorderRadius.circular(8),
+                  child: Container(
+                    padding: const EdgeInsets.all(10),
+                    decoration: BoxDecoration(
+                      border: Border.all(
+                        color: identical(candidate, selectedCandidate)
+                            ? scheme.primary
+                            : scheme.outlineVariant,
+                      ),
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    child: Row(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Icon(
+                          identical(candidate, selectedCandidate)
+                              ? Icons.radio_button_checked
+                              : Icons.radio_button_off,
+                          color: identical(candidate, selectedCandidate)
+                              ? scheme.primary
+                              : scheme.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                '${candidate.protocol.toUpperCase()} '
+                                '${candidate.localAddress}:${candidate.localPort}',
+                                style: Theme.of(context).textTheme.titleSmall,
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                [
+                                  if (candidate.state != null) candidate.state!,
+                                  candidate.confidence,
+                                ].join(' / '),
+                              ),
+                              const SizedBox(height: 3),
+                              Text(
+                                candidate.reason,
+                                style: Theme.of(context).textTheme.bodySmall,
+                              ),
+                            ],
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                ),
+              ),
+            ),
+          ],
+          if (hint != null) ...[
+            const SizedBox(height: 8),
+            Text(
+              hint!,
+              style: Theme.of(
+                context,
+              ).textTheme.bodySmall?.copyWith(color: scheme.primary),
+            ),
+          ],
+        ],
+      ),
+    );
+  }
+}
+
 class _AdvancedBackendSettingsSection extends StatelessWidget {
   const _AdvancedBackendSettingsSection({
     required this.backendHostController,
@@ -1723,6 +2863,9 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
     required this.gameServerHostController,
     required this.gameServerPortController,
     required this.adapterTargetHostController,
+    required this.secondaryIpController,
+    required this.secondaryIpInterfaceController,
+    required this.secondaryIpPrefixController,
     required this.adapterMode,
     required this.onAdapterModeChanged,
     required this.controlsEnabled,
@@ -1736,6 +2879,9 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
   final TextEditingController gameServerHostController;
   final TextEditingController gameServerPortController;
   final TextEditingController adapterTargetHostController;
+  final TextEditingController secondaryIpController;
+  final TextEditingController secondaryIpInterfaceController;
+  final TextEditingController secondaryIpPrefixController;
   final _AdapterMode adapterMode;
   final ValueChanged<_AdapterMode> onAdapterModeChanged;
   final bool controlsEnabled;
@@ -1816,6 +2962,7 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
               SizedBox(
                 width: 170,
                 child: _Field(
+                  key: const Key('advanced-game-port-field'),
                   controller: gameServerPortController,
                   label: loc.get('game_bind_port'),
                   number: true,
@@ -1835,20 +2982,16 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
                   ),
                   items: [
                     DropdownMenuItem<_AdapterMode>(
-                      value: _AdapterMode.off,
-                      child: Text(loc.get('adapter_off')),
+                      value: _AdapterMode.bundle,
+                      child: Text(loc.get('adapter_bundle')),
                     ),
                     DropdownMenuItem<_AdapterMode>(
-                      value: _AdapterMode.udpExperimental,
-                      child: Text(loc.get('adapter_udp_experimental')),
+                      value: _AdapterMode.udpOnly,
+                      child: Text(loc.get('adapter_udp_only')),
                     ),
                     DropdownMenuItem<_AdapterMode>(
-                      value: _AdapterMode.tcpRelay,
-                      child: Text(loc.get('adapter_tcp_relay')),
-                    ),
-                    DropdownMenuItem<_AdapterMode>(
-                      value: _AdapterMode.tcpForward,
-                      child: Text(loc.get('adapter_tcp_forward')),
+                      value: _AdapterMode.tcpOnly,
+                      child: Text(loc.get('adapter_tcp_only')),
                     ),
                   ],
                   onChanged: controlsEnabled
@@ -1860,10 +3003,15 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
                       : null,
                 ),
               ),
-              if (adapterMode == _AdapterMode.tcpRelay)
+              if (adapterMode == _AdapterMode.tcpOnly)
                 SizedBox(
                   width: 430,
-                  child: _HelperText(text: loc.get('adapter_tcp_relay_helper')),
+                  child: _HelperText(text: loc.get('adapter_tcp_only_helper')),
+                ),
+              if (adapterMode == _AdapterMode.bundle)
+                SizedBox(
+                  width: 430,
+                  child: _HelperText(text: loc.get('adapter_bundle_helper')),
                 ),
               SizedBox(
                 width: 210,
@@ -1871,7 +3019,35 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
                   controller: adapterTargetHostController,
                   label: loc.get('adapter_target_host'),
                   helperText: loc.get('default_host_127'),
-                  enabled: controlsEnabled && adapterMode != _AdapterMode.off,
+                  enabled: controlsEnabled,
+                ),
+              ),
+              SizedBox(
+                width: 210,
+                child: _Field(
+                  controller: secondaryIpController,
+                  label: loc.get('secondary_ip_address'),
+                  helperText: loc.get('secondary_ip_address_hint'),
+                  enabled: controlsEnabled,
+                ),
+              ),
+              SizedBox(
+                width: 180,
+                child: _Field(
+                  controller: secondaryIpInterfaceController,
+                  label: loc.get('secondary_ip_interface'),
+                  helperText: loc.get('secondary_ip_interface_hint'),
+                  enabled: controlsEnabled,
+                ),
+              ),
+              SizedBox(
+                width: 130,
+                child: _Field(
+                  controller: secondaryIpPrefixController,
+                  label: loc.get('secondary_ip_prefix'),
+                  number: true,
+                  helperText: loc.get('default_prefix_24'),
+                  enabled: controlsEnabled,
                 ),
               ),
             ],
@@ -1902,7 +3078,10 @@ String _relayStatusLabel(String status) {
     'running' => loc.get('relay_running'),
     'failed' => loc.get('relay_failed'),
     'stopped' => loc.get('relay_stopped'),
-    'starting' || 'room_created' || 'room_joined' => loc.get('relay_waiting'),
+    'starting' ||
+    'room_created' ||
+    'room_joined' ||
+    'room_ready' => loc.get('relay_waiting'),
     _ => loc.get('relay_not_ready'),
   };
 }
@@ -1945,6 +3124,7 @@ bool _sessionStatusNeedsPolling(String status) {
     'starting' ||
     'room_created' ||
     'room_joined' ||
+    'room_ready' ||
     'relay_ready' ||
     'running' => true,
     _ => false,
@@ -1982,6 +3162,8 @@ String? _statusFromEvents(List<SessionEvent> events) {
       'session_starting' => 'starting',
       'room_created' => 'room_created',
       'room_joined' => 'room_joined',
+      'room_ready' => 'room_ready',
+      'room_closed' => 'closed',
       'relay_ready' => 'relay_ready',
       'session_running' => 'running',
       'session_stopping' => 'stopping',
@@ -2020,6 +3202,7 @@ int _statusRank(String status) {
 
 class _Field extends StatelessWidget {
   const _Field({
+    super.key,
     required this.controller,
     required this.label,
     this.number = false,
@@ -2173,6 +3356,49 @@ class _LogList extends StatelessWidget {
                 );
               },
             ),
+    );
+  }
+}
+
+class _TabChip extends StatelessWidget {
+  const _TabChip({
+    required this.label,
+    required this.selected,
+    required this.onTap,
+  });
+
+  final String label;
+  final bool selected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final scheme = Theme.of(context).colorScheme;
+    return InkWell(
+      onTap: onTap,
+      borderRadius: BorderRadius.circular(6),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 8),
+        decoration: BoxDecoration(
+          color: selected
+              ? scheme.primaryContainer
+              : scheme.surfaceContainerHighest,
+          borderRadius: BorderRadius.circular(6),
+          border: Border.all(
+            color: selected ? scheme.primary : scheme.outlineVariant,
+          ),
+        ),
+        child: Text(
+          label,
+          style: TextStyle(
+            fontWeight: selected ? FontWeight.w600 : FontWeight.w400,
+            color: selected
+                ? scheme.onPrimaryContainer
+                : scheme.onSurfaceVariant,
+            fontSize: 13,
+          ),
+        ),
+      ),
     );
   }
 }

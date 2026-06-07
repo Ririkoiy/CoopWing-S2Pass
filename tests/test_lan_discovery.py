@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import socket
 import threading
 import time
@@ -15,6 +16,8 @@ from backend.lan_discovery import (
     LanPeer,
     _generate_peer_id,
 )
+
+RUN_LAN_SOCKET_TESTS = os.environ.get("COOPWING_RUN_LAN_SOCKET_TESTS") == "1"
 
 
 class TestLanPeer(unittest.TestCase):
@@ -71,7 +74,7 @@ class TestLanDiscoveryConfig(unittest.TestCase):
         self.assertGreater(c.announce_interval_seconds, 0)
         self.assertGreater(c.peer_timeout_seconds, 0)
         self.assertEqual(c.product_name, "Co-opWinG")
-        self.assertEqual(c.version, "0.3-A1")
+        self.assertEqual(c.version, "0.4.0")
         self.assertEqual(c.instance_name, "")
 
     def test_custom_values(self):
@@ -361,6 +364,10 @@ class TestRealSocketLifecycle(unittest.TestCase):
             disco.stop()
         self.assertFalse(disco._running)
 
+    @unittest.skipUnless(
+        RUN_LAN_SOCKET_TESTS,
+        "real LAN socket discovery test is environment-dependent",
+    )
     def test_two_instances_discover_each_other(self):
         a = LanDiscovery(LanDiscoveryConfig(
             instance_name="Alice",

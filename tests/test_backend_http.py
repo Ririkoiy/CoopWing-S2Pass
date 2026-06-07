@@ -10,12 +10,20 @@ import json
 import os
 import sys
 import threading
+import time
 import unittest
 
 # Ensure backend is importable
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from backend.lan_discovery import LanPeer
+from backend.process_port_detector import (
+    ProcessPortCandidate,
+    ProcessPortDetectionError,
+    ProcessPortScanResult,
+)
 from backend.server import make_server
+from secondary_ip_manager import AdapterBindDecision, SecondaryIpRecommendation, SecondaryIpStatus
 
 
 def _request(method: str, path: str, body=None, host="127.0.0.1", port=0):
@@ -45,6 +53,14 @@ def _json_contains_key(data, key):
     if isinstance(data, list):
         return any(_json_contains_key(value, key) for value in data)
     return False
+
+
+def _alice_participant():
+    return {"player_id": "p_alice000001", "player_name": "Alice", "is_host": True}
+
+
+def _bob_participant():
+    return {"player_id": "p_bob00000002", "player_name": "Bob", "is_host": False}
 
 
 class HTTPTestBase(unittest.TestCase):
@@ -96,12 +112,107 @@ class TestHealthEndpoint(HTTPTestBase):
 
     def test_health_version(self):
         _, data = self.req("GET", "/health")
-        self.assertEqual(data["version"], "0.1.0")
+        self.assertEqual(data["version"], "0.4.0")
 
     def test_health_uptime(self):
         _, data = self.req("GET", "/health")
         self.assertIn("uptime_seconds", data)
         self.assertGreaterEqual(data["uptime_seconds"], 0)
+
+    def test_health_exposes_backend_admin_state(self):
+        _, data = self.req("GET", "/health")
+        self.assertIn("backend_admin", data)
+        self.assertFalse(data["backend_admin"])
+
+
+class _FakeProcessPortDetector:
+    def __init__(self):
+        self.calls = []
+
+    def scan_pid(self, pid):
+        self.calls.append(pid)
+        if pid == 99999:
+            raise ProcessPortDetectionError(
+                "INVALID_PID",
+                "No running process found for PID 99999",
+            )
+        return ProcessPortScanResult(
+            pid=pid,
+            candidates=[
+                ProcessPortCandidate(
+                    pid=pid,
+                    protocol="tcp",
+                    local_address="0.0.0.0",
+                    local_port=27015,
+                    state="Listen",
+                    confidence="high",
+                    reason="TCP LISTEN on 0.0.0.0:27015",
+                ),
+                ProcessPortCandidate(
+                    pid=pid,
+                    protocol="udp",
+                    local_address="0.0.0.0",
+                    local_port=27016,
+                    confidence="high",
+                    reason="UDP bound 0.0.0.0:27016",
+                ),
+            ],
+        )
+
+
+class TestProcessPortEndpoint(unittest.TestCase):
+    def setUp(self):
+        self.detector = _FakeProcessPortDetector()
+        self.server = make_server(
+            host="127.0.0.1",
+            port=0,
+            quiet=True,
+            process_port_detector=self.detector,
+        )
+        self.port = self.server.server_address[1]
+        self.thread = threading.Thread(
+            target=self.server.serve_forever,
+            daemon=True,
+        )
+        self.thread.start()
+
+    def tearDown(self):
+        self.server.shutdown()
+        self.thread.join(timeout=2)
+        self.server.server_close()
+
+    def req(self, method, path, body=None):
+        return _request(method, path, body=body, port=self.port)
+
+    def test_scan_returns_structured_candidates(self):
+        status, data = self.req("POST", "/process-ports/scan", {"pid": 12345})
+
+        self.assertEqual(status, 200)
+        self.assertEqual(self.detector.calls, [12345])
+        self.assertEqual(data["pid"], 12345)
+        self.assertEqual(len(data["candidates"]), 2)
+        self.assertEqual(data["candidates"][0]["protocol"], "tcp")
+        self.assertEqual(data["candidates"][0]["local_port"], 27015)
+        self.assertEqual(data["candidates"][1]["protocol"], "udp")
+        self.assertTrue(data["candidates"][1]["reason"])
+
+    def test_invalid_pid_returns_clean_error(self):
+        status, data = self.req("POST", "/process-ports/scan", {"pid": 0})
+
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"]["code"], "INVALID_PID")
+
+    def test_missing_process_returns_clean_error(self):
+        status, data = self.req("POST", "/process-ports/scan", {"pid": 99999})
+
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"]["code"], "INVALID_PID")
+
+    def test_get_is_not_allowed(self):
+        status, data = self.req("GET", "/process-ports/scan")
+
+        self.assertEqual(status, 405)
+        self.assertEqual(data["error"]["code"], "METHOD_NOT_ALLOWED")
 
 
 class TestBackendRunnerMode(unittest.TestCase):
@@ -137,6 +248,383 @@ class TestBackendRunnerMode(unittest.TestCase):
             )
 
         self.assertIn("Invalid backend runner mode", str(ctx.exception))
+
+
+class _FakeLanDiscovery:
+    instances = []
+    fail_start = False
+
+    def __init__(self, config):
+        self.config = config
+        self.peer_id = "ld_fakeapi0001"
+        self.peers = []
+        self.started = False
+        self.start_count = 0
+        self.stop_count = 0
+        self.get_peers_count = 0
+        self.__class__.instances.append(self)
+
+    def start(self):
+        self.start_count += 1
+        if self.fail_start:
+            raise OSError("port already in use")
+        self.started = True
+
+    def stop(self):
+        self.stop_count += 1
+        self.started = False
+        self.peers = []
+
+    def get_peers(self):
+        self.get_peers_count += 1
+        return list(self.peers)
+
+
+class LanDiscoveryHTTPTestBase(unittest.TestCase):
+    """LAN discovery HTTP tests with a fake discovery engine."""
+
+    def setUp(self):
+        _FakeLanDiscovery.instances = []
+        _FakeLanDiscovery.fail_start = False
+        self._server = make_server(
+            host="127.0.0.1",
+            port=0,
+            quiet=True,
+            lan_discovery_factory=_FakeLanDiscovery,
+        )
+        self._port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def tearDown(self):
+        self._server.shutdown()
+        self._thread.join(timeout=2)
+        self._server.server_close()
+
+    def req(self, method, path, body=None):
+        return _request(method, path, body=body, port=self._port)
+
+    @property
+    def fake(self):
+        return _FakeLanDiscovery.instances[0]
+
+
+class _FakeSecondaryIpManager:
+    def __init__(self, decision):
+        self.decision = decision
+        self.calls = []
+
+    def has_ip_mutation_permission(self):
+        return bool(getattr(self.decision, "backend_admin", False))
+
+    def choose_adapter_bind_host(
+        self,
+        requested_ip,
+        default_bind_host="127.0.0.1",
+        interface_hint=None,
+        prefix_length=None,
+    ):
+        self.calls.append((
+            requested_ip,
+            default_bind_host,
+            interface_hint,
+            prefix_length,
+        ))
+        return self.decision
+
+    def recommend_secondary_ip(self):
+        return SecondaryIpRecommendation(
+            available=True,
+            backend_admin=self.has_ip_mutation_permission(),
+            interface_index=18,
+            interface_alias="Ethernet",
+            interface_description="Intel Ethernet",
+            interface_ip="192.168.5.42",
+            prefix_length=24,
+            recommended_ip="192.168.5.233",
+        )
+
+    def startup_cleanup_stale_leases(self):
+        return self._cleanup_result()
+
+    def auto_allocate_on_admin_startup(self):
+        return SecondaryIpStatus(
+            allocated=False,
+            backend_admin=self.has_ip_mutation_permission(),
+            source="auto",
+        )
+
+    def release_allocated_secondary_ip(self):
+        return self._cleanup_result()
+
+    def get_secondary_ip_status(self):
+        return SecondaryIpStatus(
+            allocated=False,
+            backend_admin=self.has_ip_mutation_permission(),
+        )
+
+    @staticmethod
+    def _cleanup_result():
+        from secondary_ip_manager import CleanupResult
+        return CleanupResult(items=[], ok=True)
+
+
+class SecondaryIpHTTPTestBase(unittest.TestCase):
+    def setUp(self):
+        self.secondary = _FakeSecondaryIpManager(
+            AdapterBindDecision(
+                bind_host="127.0.0.1",
+                secondary_ip_enabled=False,
+                fallback_used=True,
+                warning=(
+                    "failed to add secondary IP: verification failed after "
+                    "New-NetIPAddress: 192.168.5.233 is not present on "
+                    "interface 18 (Ethernet)"
+                ),
+            )
+        )
+        self._server = make_server(
+            host="127.0.0.1",
+            port=0,
+            quiet=True,
+            secondary_ip_manager=self.secondary,
+        )
+        self._port = self._server.server_address[1]
+        self._thread = threading.Thread(target=self._server.serve_forever, daemon=True)
+        self._thread.start()
+
+    def tearDown(self):
+        self._server.shutdown()
+        self._thread.join(timeout=2)
+        self._server.server_close()
+
+    def req(self, method, path, body=None):
+        return _request(method, path, body=body, port=self._port)
+
+
+class TestLanDiscoveryHttpEndpoints(LanDiscoveryHTTPTestBase):
+    def test_status_initial_state_is_stopped(self):
+        status, data = self.req("GET", "/api/lan-discovery/status")
+
+        self.assertEqual(status, 200)
+        self.assertFalse(data["running"])
+        self.assertIsNone(data["peer_id"])
+        self.assertEqual(data["peer_count"], 0)
+        self.assertIn("instance_name", data)
+        self.assertIsInstance(data["service_port"], int)
+        self.assertEqual(data["broadcast_port"], 21521)
+
+    def test_start_is_idempotent_and_reuses_single_discovery_instance(self):
+        first_status, first_data = self.req("POST", "/api/lan-discovery/start")
+        second_status, second_data = self.req("POST", "/api/lan-discovery/start")
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertTrue(first_data["running"])
+        self.assertTrue(second_data["running"])
+        self.assertEqual(first_data["peer_id"], "ld_fakeapi0001")
+        self.assertEqual(second_data["peer_id"], "ld_fakeapi0001")
+        self.assertEqual(len(_FakeLanDiscovery.instances), 1)
+        self.assertEqual(self.fake.start_count, 1)
+
+    def test_peers_returns_snapshot_with_age_not_raw_last_seen(self):
+        self.req("POST", "/api/lan-discovery/start")
+        self.fake.peers = [
+            LanPeer(
+                peer_id="ld_peer0000001",
+                name="PeerBox",
+                host="192.168.5.44",
+                port=21520,
+                version="0.3-A1",
+                last_seen=time.monotonic() - 2.0,
+            ),
+        ]
+
+        status, data = self.req("GET", "/api/lan-discovery/peers")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(data["running"])
+        self.assertEqual(len(data["peers"]), 1)
+        peer = data["peers"][0]
+        self.assertEqual(peer["peer_id"], "ld_peer0000001")
+        self.assertEqual(peer["name"], "PeerBox")
+        self.assertEqual(peer["host"], "192.168.5.44")
+        self.assertEqual(peer["port"], 21520)
+        self.assertEqual(peer["version"], "0.3-A1")
+        self.assertIsInstance(peer["last_seen_age_seconds"], (int, float))
+        self.assertGreaterEqual(peer["last_seen_age_seconds"], 0.0)
+        self.assertNotIn("last_seen", peer)
+
+    def test_peers_when_stopped_returns_empty_without_starting(self):
+        status, data = self.req("GET", "/api/lan-discovery/peers")
+
+        self.assertEqual(status, 200)
+        self.assertFalse(data["running"])
+        self.assertEqual(data["peers"], [])
+        self.assertEqual(self.fake.start_count, 0)
+
+    def test_stop_is_idempotent_before_and_after_start(self):
+        first_status, first_data = self.req("POST", "/api/lan-discovery/stop")
+        self.req("POST", "/api/lan-discovery/start")
+        second_status, second_data = self.req("POST", "/api/lan-discovery/stop")
+        third_status, third_data = self.req("POST", "/api/lan-discovery/stop")
+
+        self.assertEqual(first_status, 200)
+        self.assertEqual(second_status, 200)
+        self.assertEqual(third_status, 200)
+        self.assertFalse(first_data["running"])
+        self.assertFalse(second_data["running"])
+        self.assertFalse(third_data["running"])
+        self.assertEqual(self.fake.stop_count, 1)
+
+    def test_start_failure_returns_error_and_rolls_back_status(self):
+        _FakeLanDiscovery.fail_start = True
+
+        status, data = self.req("POST", "/api/lan-discovery/start")
+        status_after, data_after = self.req("GET", "/api/lan-discovery/status")
+
+        self.assertEqual(status, 503)
+        self.assertEqual(data["error"]["code"], "LAN_DISCOVERY_START_FAILED")
+        self.assertIn("port already in use", data["error"]["details"]["reason"])
+        self.assertEqual(status_after, 200)
+        self.assertFalse(data_after["running"])
+        self.assertIsNone(data_after["peer_id"])
+        self.assertEqual(data_after["peer_count"], 0)
+
+    def test_lan_discovery_responses_do_not_expose_core_protocol_fields(self):
+        self.req("POST", "/api/lan-discovery/start")
+        self.fake.peers = [
+            LanPeer(
+                peer_id="ld_peer0000002",
+                name="PeerBox",
+                host="192.168.5.45",
+                port=21520,
+                version="0.3-A1",
+            ),
+        ]
+
+        _, status_data = self.req("GET", "/api/lan-discovery/status")
+        _, peers_data = self.req("GET", "/api/lan-discovery/peers")
+
+        forbidden_keys = {
+            "room_id", "player_id", "relay_token", "relay_ip", "relay_port",
+        }
+        forbidden_values = {
+            "CREATE_ROOM", "JOIN_ROOM", "RELAY_ENABLED",
+        }
+        for data in (status_data, peers_data):
+            for key in forbidden_keys:
+                self.assertFalse(
+                    _json_contains_key(data, key),
+                    f"LAN discovery API must not expose core protocol field: {key}",
+                )
+            encoded = json.dumps(data)
+            for value in forbidden_values:
+                self.assertNotIn(value, encoded)
+
+    def test_create_session_does_not_stop_lan_discovery_or_hide_peers(self):
+        self.req("POST", "/api/lan-discovery/start")
+        self.fake.peers = [
+            LanPeer(
+                peer_id="ld_peer0000003",
+                name="PeerBox",
+                host="192.168.5.46",
+                port=21520,
+                version="0.3-A1",
+            ),
+        ]
+
+        status, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "game_server_port": 27015,
+        })
+        status_after, discovery = self.req("GET", "/api/lan-discovery/status")
+        peers_status, peers = self.req("GET", "/api/lan-discovery/peers")
+
+        self.assertEqual(status, 201)
+        self.assertEqual(status_after, 200)
+        self.assertEqual(peers_status, 200)
+        self.assertTrue(discovery["running"])
+        self.assertTrue(peers["running"])
+        self.assertEqual(peers["peers"][0]["peer_id"], "ld_peer0000003")
+        self.assertEqual(self.fake.stop_count, 0)
+
+    def test_join_session_does_not_stop_lan_discovery(self):
+        self.req("POST", "/api/lan-discovery/start")
+
+        status, _ = self.req("POST", "/sessions/join", {
+            "server_host": "192.168.1.10",
+            "room_id": "ABC234",
+            "player_name": "JoinerB",
+        })
+        status_after, discovery = self.req("GET", "/api/lan-discovery/status")
+
+        self.assertEqual(status, 201)
+        self.assertEqual(status_after, 200)
+        self.assertTrue(discovery["running"])
+        self.assertEqual(self.fake.stop_count, 0)
+
+
+class TestSecondaryIpHttpDetails(SecondaryIpHTTPTestBase):
+    def test_recommendation_endpoint_returns_default_interface_and_ip(self):
+        status, data = self.req("GET", "/api/secondary-ip/recommendation")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(data["available"])
+        self.assertFalse(data["backend_admin"])
+        self.assertEqual(data["interface_index"], 18)
+        self.assertEqual(data["interface_alias"], "Ethernet")
+        self.assertEqual(data["interface_ip"], "192.168.5.42")
+        self.assertEqual(data["prefix_length"], 24)
+        self.assertEqual(data["recommended_ip"], "192.168.5.233")
+
+    def test_release_endpoint_returns_ok(self):
+        status, data = self.req("POST", "/api/secondary-ip/release")
+        self.assertEqual(status, 200)
+        self.assertTrue(data["ok"])
+        self.assertIsInstance(data["items"], list)
+
+    def test_status_endpoint_returns_snapshot(self):
+        status, data = self.req("GET", "/api/secondary-ip/status")
+        self.assertEqual(status, 200)
+        self.assertIn("allocated", data)
+        self.assertIn("backend_admin", data)
+        self.assertIn("bind_mode", data)
+        self.assertIn("source", data)
+        self.assertIn("last_error", data)
+
+    def test_create_returns_detailed_secondary_ip_add_error(self):
+        status, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "game_server_port": 27015,
+            "adapter_config": {
+                "enabled": True,
+                "bind_host": "127.0.0.1",
+                "target_host": "127.0.0.1",
+                "target_port": 27015,
+                "secondary_ip_request": {
+                    "ip_address": "192.168.5.233",
+                    "interface_hint": "18",
+                    "prefix_length": 24,
+                },
+            },
+        })
+
+        self.assertEqual(status, 201)
+        self.assertFalse(data["secondary_ip_enabled"])
+        self.assertTrue(data["secondary_ip_fallback_used"])
+        self.assertIn("verification failed", data["secondary_ip_warning"])
+        self.assertIn("interface 18", data["secondary_ip_warning"])
+        self.assertFalse(data["backend_admin"])
+        self.assertEqual(data["adapter_bind_mode"], "loopback")
+        self.assertIsNone(data["secondary_ip_bind_address"])
+        self.assertEqual(
+            self.secondary.calls,
+            [("192.168.5.233", "127.0.0.1", "18", 24)],
+        )
+        self.assertFalse(_json_contains_key(data, "relay_token"))
 
 
 class TestCreateSessionEndpoint(HTTPTestBase):
@@ -264,6 +752,26 @@ class TestCreateSessionEndpoint(HTTPTestBase):
         self.assertEqual(data["adapter_status"]["status"], "stopped")
         self.assertEqual(data["adapter_status"]["adapter_type"], "local_udp_bridge")
 
+    def test_create_status_exposes_secondary_ip_fields(self):
+        status, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "adapter_config": {
+                "enabled": True,
+                "target_host": "127.0.0.1",
+                "target_port": 27015,
+                "secondary_ip_request": {"ip_address": "192.168.1.250"},
+            },
+        })
+
+        self.assertEqual(status, 201)
+        self.assertFalse(data["secondary_ip_enabled"])
+        self.assertTrue(data["secondary_ip_fallback_used"])
+        self.assertIn("backend process is not elevated", data["secondary_ip_warning"])
+        self.assertFalse(data["backend_admin"])
+        self.assertEqual(data["adapter_bind_mode"], "loopback")
+        self.assertNotIn("relay_token", data)
+
     def test_create_udp_adapter_config_is_not_tcp_forward(self):
         status, data = self.req("POST", "/sessions/create", {
             "server_host": "192.168.1.10",
@@ -322,6 +830,66 @@ class TestCreateSessionEndpoint(HTTPTestBase):
         self.assertEqual(data["adapter_status"]["adapter_type"], "tcp_forward")
         self.assertGreater(data["adapter_status"]["bind_port"], 0)
         self.assertEqual(data["adapter_status"]["target_port"], 25565)
+
+    def test_create_with_bundle_starts_and_stops_tcp_udp_rules(self):
+        status, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "game_server_port": 27015,
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "bundle",
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "target_host": "127.0.0.1",
+                "target_port": 27015,
+            },
+        })
+        self.assertEqual(status, 201)
+        self.assertEqual(data["status"], "running")
+        self.assertEqual(data["adapter_status"]["status"], "ready")
+        self.assertEqual(data["adapter_status"]["adapter_type"], "bundle")
+        self.assertGreater(data["adapter_status"]["bind_port"], 0)
+        self.assertEqual(
+            len(data["adapter_status"]["payload_diagnostics"]["started_rule_ids"]),
+            3,
+        )
+        self.assertEqual(
+            data["adapter_status"]["payload_diagnostics"]["included_rule_kinds"],
+            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+        )
+        self.assertNotEqual(
+            data["adapter_status"]["payload_diagnostics"][
+                "udp_broadcast_bind_port"
+            ],
+            data["adapter_status"]["bind_port"],
+        )
+
+        stop_status, stopped = self.req(
+            "POST",
+            f"/sessions/{data['session_id']}/stop",
+        )
+        self.assertEqual(stop_status, 200)
+        self.assertEqual(stopped["status"], "stopped")
+        self.assertEqual(stopped["adapter_status"]["status"], "stopped")
+
+    def test_create_bundle_without_target_port_returns_400(self):
+        status, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "bundle",
+                "bind_port": 0,
+            },
+        })
+
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
+        self.assertEqual(
+            data["error"]["details"]["field"],
+            "adapter_config.target_port",
+        )
 
     def test_create_with_invalid_adapter_config_returns_400(self):
         status, data = self.req("POST", "/sessions/create", {
@@ -436,6 +1004,7 @@ class TestJoinSessionEndpoint(HTTPTestBase):
             "player_name": "JoinerB",
             "adapter_config": {
                 "enabled": True,
+                "adapter_type": "local_udp_bridge",
                 "bind_port": 0,
             },
         })
@@ -443,6 +1012,48 @@ class TestJoinSessionEndpoint(HTTPTestBase):
         self.assertEqual(data["status"], "running")
         self.assertEqual(data["adapter_status"]["status"], "stopped")
         self.assertNotIn("target_port", data["adapter_status"])
+        self.assertFalse(_json_contains_key(data, "relay_token"))
+
+    def test_join_bundle_without_game_server_port_starts_local_rules(self):
+        status, data = self.req("POST", "/sessions/join", {
+            "server_host": "192.168.1.10",
+            "room_id": "RN4Y78",
+            "player_name": "JoinerB",
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "bundle",
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "target_host": "127.0.0.1",
+                "target_port": 27015,
+            },
+        })
+
+        self.assertEqual(status, 201)
+        self.assertNotIn("game_server_port", data)
+        self.assertEqual(data["status"], "running")
+        adapter_status = data["adapter_status"]
+        diagnostics = adapter_status["payload_diagnostics"]
+        self.assertEqual(adapter_status["status"], "ready")
+        self.assertEqual(adapter_status["adapter_type"], "bundle")
+        self.assertEqual(adapter_status["target_port"], 27015)
+        self.assertGreater(adapter_status["bind_port"], 0)
+        self.assertEqual(
+            diagnostics["included_rule_kinds"],
+            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+        )
+        self.assertEqual(
+            diagnostics["local_game_connection"],
+            {"host": "127.0.0.1", "port": adapter_status["bind_port"]},
+        )
+        self.assertEqual(
+            [rule["kind"] for rule in diagnostics["rules"]],
+            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+        )
+        self.assertNotEqual(
+            diagnostics["rules"][2]["local_bind_port"],
+            adapter_status["bind_port"],
+        )
         self.assertFalse(_json_contains_key(data, "relay_token"))
 
 
@@ -490,6 +1101,7 @@ class TestStatusEndpoint(HTTPTestBase):
             "player_name": "Alice",
             "adapter_config": {
                 "enabled": True,
+                "adapter_type": "local_udp_bridge",
                 "bind_port": 40100,
                 "target_port": 27015,
             },
@@ -510,7 +1122,82 @@ class TestStatusEndpoint(HTTPTestBase):
             },
         })
         _, data = self.req("GET", f"/sessions/{created['session_id']}/status")
+        self.assertEqual(data["adapter_status"]["adapter_type"], "bundle")
         self.assertFalse(_json_contains_key(data, "relay_token"))
+
+    def test_v1_status_response_includes_compatible_room_defaults(self):
+        _, created = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "Alice",
+        })
+
+        status, data = self.req("GET", f"/sessions/{created['session_id']}/status")
+
+        self.assertEqual(status, 200)
+        self.assertIsNone(data["protocol_version"])
+        self.assertIsNone(data["max_players"])
+        self.assertIsNone(data["participant_count"])
+        self.assertEqual(data["participants"], [])
+        self.assertIsNone(data["host_player_id"])
+        self.assertFalse(data["room_ready"])
+        self.assertFalse(data["room_closed"])
+        self.assertTrue(data["relay_ready"])
+        self.assertFalse(data["relay_token_available"])
+        self.assertIsNone(data["relay_target_host"])
+        self.assertIsNone(data["relay_target_port"])
+
+    def test_v2_status_response_includes_participants_and_relay_target(self):
+        _, created = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "Alice",
+        })
+        manager = getattr(self._server, "_manager")
+        manager._emit_event(created["session_id"], "room_updated", "Room updated", {
+            "room_id": created["room_id"],
+            "event": "participant_joined",
+            "participant_count": 2,
+            "max_players": 4,
+            "host_player_id": "p_alice000001",
+            "participants": [_alice_participant(), _bob_participant()],
+            "server_time": 1716192000.0,
+        })
+        manager._emit_event(created["session_id"], "relay_ready", "Relay path ready", {
+            "room_id": created["room_id"],
+            "relay_token_available": True,
+            "relay_target_host": "203.0.113.10",
+            "relay_target_port": 9001,
+        })
+
+        status, data = self.req("GET", f"/sessions/{created['session_id']}/status")
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data["protocol_version"], 2)
+        self.assertEqual(data["max_players"], 4)
+        self.assertEqual(data["participant_count"], 2)
+        self.assertEqual(data["participants"], [_alice_participant(), _bob_participant()])
+        self.assertEqual(data["host_player_id"], "p_alice000001")
+        self.assertEqual(data["last_room_event"], "participant_joined")
+        self.assertTrue(data["relay_ready"])
+        self.assertTrue(data["relay_token_available"])
+        self.assertEqual(data["relay_target_host"], "203.0.113.10")
+        self.assertEqual(data["relay_target_port"], 9001)
+        self.assertFalse(_json_contains_key(data, "relay_token"))
+
+    def test_status_room_closed_after_room_closed_event(self):
+        _, created = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "Alice",
+        })
+        manager = getattr(self._server, "_manager")
+
+        manager._emit_event(created["session_id"], "room_closed", "Room closed", {
+            "room_id": created["room_id"],
+        })
+        status, data = self.req("GET", f"/sessions/{created['session_id']}/status")
+
+        self.assertEqual(status, 200)
+        self.assertTrue(data["room_closed"])
+        self.assertEqual(data["status"], "closed")
 
 
 class TestStopEndpoint(HTTPTestBase):
@@ -546,6 +1233,23 @@ class TestStopEndpoint(HTTPTestBase):
 
         self.assertEqual(status, 200)
         self.assertEqual(data["status"], "failed")
+
+    def test_stop_join_session_returns_stopped_without_room_closed_event(self):
+        _, joined = self.req("POST", "/sessions/join", {
+            "server_host": "192.168.1.10",
+            "room_id": "ABC234",
+            "player_name": "Bob",
+        })
+
+        status, data = self.req("POST", f"/sessions/{joined['session_id']}/stop")
+        _, logs = self.req("GET", f"/sessions/{joined['session_id']}/logs")
+        types = [event["type"] for event in logs["events"]]
+
+        self.assertEqual(status, 200)
+        self.assertEqual(data["role"], "join")
+        self.assertEqual(data["status"], "stopped")
+        self.assertNotIn("room_closed", types)
+        self.assertFalse(data["room_closed"])
 
     def test_stop_unknown_session_returns_404(self):
         status, data = self.req("POST", "/sessions/s_missing/stop")

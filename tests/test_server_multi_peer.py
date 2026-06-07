@@ -577,6 +577,59 @@ class TestV2RoomLifecycle(unittest.IsolatedAsyncioTestCase):
         ]
         self.assertEqual(bob_leave_updates, [])
 
+    async def test_v2_joiner_leave_keeps_host_room_when_one_remains(self) -> None:
+        """A non-host leaving a two-player v2 room does not close the host room."""
+        room_id, alice_id, alice_writer = await self._create_v2_room(max_players=4)
+        bob_id, bob_writer, _ = await self._join_v2(room_id, "Bob", conn_index=1)
+
+        alice_addr = ("198.51.100.30", 42000)
+        bob_addr = ("198.51.100.31", 42001)
+        await self._register_udp(alice_id, room_id, alice_addr)
+        await self._register_udp(bob_id, room_id, bob_addr)
+
+        room = self.server._rooms[room_id]
+        self.assertEqual(room.state, srv.STATE_RELAY)
+        self.assertIsNotNone(room.relay_session)
+        token = room.relay_session.relay_token
+        alice_update_count = len(_messages_of_type(alice_writer, srv.MSG_ROOM_UPDATED))
+
+        await self.server._handle_leave_room({"room_id": room_id}, bob_id)
+
+        self.assertIn(room_id, self.server._rooms)
+        self.assertIs(self.server._rooms[room_id], room)
+        self.assertEqual(room.state, srv.STATE_RELAY)
+        self.assertIsNotNone(room.relay_session)
+        self.assertIn(token, self.server._relay_sessions)
+        self.assertEqual(list(room.participants.keys()), [alice_id])
+        self.assertIsNone(room.joiner_id)
+        self.assertEqual(room.relay_enabled_players, {alice_id})
+        self.assertIn(alice_id, self.server._players)
+        self.assertIn(alice_addr, self.server._udp_to_player)
+        self.assertNotIn(bob_id, self.server._players)
+        self.assertNotIn(bob_addr, self.server._udp_to_player)
+
+        new_alice_updates = _messages_of_type(alice_writer, srv.MSG_ROOM_UPDATED)[alice_update_count:]
+        self.assertEqual([m["payload"]["event"] for m in new_alice_updates], ["participant_left"])
+        self._assert_participants(new_alice_updates[0]["payload"], ["Alice"])
+        self.assertEqual(new_alice_updates[0]["payload"]["room_id"], room_id)
+        self.assertEqual(new_alice_updates[0]["payload"]["participant_count"], 1)
+        self.assertEqual(
+            [
+                m["payload"]["event"]
+                for m in _messages_of_type(alice_writer, srv.MSG_ROOM_UPDATED)
+                if m["payload"]["event"] == "room_closed"
+            ],
+            [],
+        )
+        self.assertEqual(
+            [
+                m["payload"]["event"]
+                for m in _messages_of_type(bob_writer, srv.MSG_ROOM_UPDATED)
+                if m["payload"]["event"] == "room_closed"
+            ],
+            [],
+        )
+
 
 class TestV2RelayActivation(unittest.IsolatedAsyncioTestCase):
     """Implemented E3 UDP REG and RELAY_ENABLED activation behavior."""

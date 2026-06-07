@@ -8,18 +8,25 @@ import time
 import unittest
 from unittest import mock
 
-from adapters.transport import FakePairTransport
+from adapters.transport import FakePairTransport, make_fake_pair
+from backend.adapter_manager import AdapterManager
 from backend.models import (
     ADAPTER_STATUS_READY,
     AdapterCounters,
     AdapterStatus,
     BackendError,
+    ParticipantDto,
+    SessionInfo,
+    SessionStats,
+    BUNDLE_STATUS_FAILED,
+    BundleResult,
 )
 from backend.session_manager import (
     FakeSessionRunner,
     RUNNER_MODE_ENV,
     SessionManager,
 )
+from secondary_ip_manager import AdapterBindDecision
 
 
 class FakeCoreHandle:
@@ -104,6 +111,21 @@ def _dict_contains_key(data, key):
     return False
 
 
+def _dict_contains_value(data, value, only_port_keys=False):
+    if isinstance(data, dict):
+        for key, item in data.items():
+            if (not only_port_keys or "port" in str(key)) and item == value:
+                return True
+            if _dict_contains_value(item, value, only_port_keys=only_port_keys):
+                return True
+    if isinstance(data, list):
+        return any(
+            _dict_contains_value(item, value, only_port_keys=only_port_keys)
+            for item in data
+        )
+    return False
+
+
 class RecordingRunner:
     def __init__(self):
         self.calls = []
@@ -126,6 +148,20 @@ class RecordingRunner:
         self.calls.append(("stop", info.session_id))
         emit("session_stopping", "Session stopping", {"session_id": info.session_id})
         emit("session_stopped", "Session stopped", {"session_id": info.session_id})
+
+
+class FailingBundleRunner:
+    def start(self, bundle):
+        return BundleResult(
+            bundle_id=bundle.id,
+            status=BUNDLE_STATUS_FAILED,
+            failed_rule_id=bundle.rules[1].id,
+            failed_rule_kind=bundle.rules[1].kind,
+            error_detail="UDP bundle rule failed",
+        )
+
+    def stop(self):
+        raise AssertionError("failed bundle must not be retained as running")
 
 
 class DelayedConfirmedCreateRunner:
@@ -204,6 +240,57 @@ class ManualRelayReadyRunner:
         emit("session_stopped", "Session stopped", {"session_id": info.session_id})
 
 
+def _alice_participant():
+    return {"player_id": "p_alice000001", "player_name": "Alice", "is_host": True}
+
+
+def _bob_participant():
+    return {"player_id": "p_bob00000002", "player_name": "Bob", "is_host": False}
+
+
+class ManualV2RoomRunner:
+    def __init__(self):
+        self.emit = None
+        self.info = None
+
+    def _created_payload(self, info):
+        return {
+            "room_id": info.room_id or "V2ROOM",
+            "player_id": "p_alice000001",
+            "protocol_version": 2,
+            "max_players": 4,
+            "participants": [_alice_participant()],
+            "participant_count": 1,
+        }
+
+    def start_create(self, info, emit):
+        self.info = info
+        self.emit = emit
+        if info.room_id is None:
+            info.room_id = "V2ROOM"
+        emit("room_created", f"Room {info.room_id} created", self._created_payload(info))
+
+    def start_join(self, info, emit):
+        self.info = info
+        self.emit = emit
+        emit(
+            "room_joined",
+            f"Joined room {info.room_id}",
+            {
+                "room_id": info.room_id,
+                "player_id": "p_bob00000002",
+                "protocol_version": 2,
+                "max_players": 4,
+                "participants": [_alice_participant(), _bob_participant()],
+                "participant_count": 2,
+            },
+        )
+
+    def stop(self, info, emit):
+        emit("session_stopping", "Session stopping", {"session_id": info.session_id})
+        emit("session_stopped", "Session stopped", {"session_id": info.session_id})
+
+
 class RoomNotFoundJoinRunner(RecordingRunner):
     def start_join(self, info, emit):
         self.calls.append(("start_join", info.session_id))
@@ -235,6 +322,27 @@ class SnapshotAdapterManager:
                 bytes_to_game=40,
             ),
         )
+
+
+class FakeSecondaryIpManager:
+    def __init__(self, decision):
+        self.decision = decision
+        self.calls = []
+
+    def choose_adapter_bind_host(
+        self,
+        requested_ip,
+        default_bind_host="127.0.0.1",
+        interface_hint=None,
+        prefix_length=None,
+    ):
+        self.calls.append((
+            requested_ip,
+            default_bind_host,
+            interface_hint,
+            prefix_length,
+        ))
+        return self.decision
 
 
 class TestSessionManager(unittest.TestCase):
@@ -353,6 +461,7 @@ class TestSessionManager(unittest.TestCase):
                     "player_name": "CreatorA",
                     "adapter_config": {
                         "enabled": True,
+                        "adapter_type": "local_udp_bridge",
                         "bind_host": "203.0.113.1",
                         "bind_port": 40100,
                     },
@@ -365,6 +474,72 @@ class TestSessionManager(unittest.TestCase):
         self.assertEqual(FakeCoreTransport.instances[0].close_count, 1)
         types = [event.type for event in logs]
         self.assertLess(types.index("session_running"), types.index("adapter_error"))
+
+    def test_bundle_start_failure_marks_join_session_failed_with_events(self):
+        adapter_manager = AdapterManager(
+            bundle_transport_factory=lambda session_id, config: make_fake_pair()[0],
+            bundle_runner_factory=FailingBundleRunner,
+        )
+        mgr = SessionManager(adapter_manager=adapter_manager)
+
+        info = mgr.join_session({
+            "server_host": "127.0.0.1",
+            "room_id": "ABC234",
+            "player_name": "JoinerB",
+            "game_server_port": 27015,
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "bundle",
+                "bind_port": 41003,
+                "target_port": 27015,
+            },
+        })
+        logs = mgr.get_logs(info.session_id)
+
+        self.assertEqual(info.status, "failed")
+        self.assertEqual(info.error["code"], "BUNDLE_START_FAILED")
+        self.assertEqual(info.adapter_status.status, "error")
+        self.assertEqual(
+            [event.type for event in logs][-2:],
+            ["adapter_error", "session_failed"],
+        )
+
+    def test_bundle_attaches_core_transport_for_broadcast_rule(self):
+        RealCoreRunnerStub.reset()
+        FakeCoreTransport.reset()
+        with mock.patch("backend.core_session_runner.CoreSessionRunner", RealCoreRunnerStub):
+            with mock.patch(
+                "adapters.core_transport_adapter.CoreTransportAdapter",
+                FakeCoreTransport,
+            ):
+                mgr = SessionManager(runner_mode="real_core")
+                info = mgr.join_session({
+                    "server_host": "127.0.0.1",
+                    "room_id": "ABC234",
+                    "player_name": "JoinerB",
+                    "game_server_port": 27015,
+                    "adapter_config": {
+                        "enabled": True,
+                        "adapter_type": "bundle",
+                        "bind_port": 0,
+                        "target_port": 27015,
+                    },
+                })
+                try:
+                    self.assertEqual(info.status, "running")
+                    self.assertEqual(info.adapter_status.status, "ready")
+                    self.assertEqual(len(FakeCoreTransport.instances), 1)
+                    adapter_ready = next(
+                        event
+                        for event in mgr.get_logs(info.session_id)
+                        if event.type == "adapter_ready"
+                    )
+                    self.assertIn(
+                        "UDP Broadcast/LAN Discovery",
+                        adapter_ready.message,
+                    )
+                finally:
+                    mgr.stop_session(info.session_id)
 
     def test_stop_real_core_adapter_stops_adapter_before_runner(self):
         RealCoreRunnerStub.reset()
@@ -380,6 +555,7 @@ class TestSessionManager(unittest.TestCase):
                     "player_name": "CreatorA",
                     "adapter_config": {
                         "enabled": True,
+                        "adapter_type": "local_udp_bridge",
                         "bind_port": 0,
                     },
                 })
@@ -412,6 +588,7 @@ class TestSessionManager(unittest.TestCase):
                     "player_name": "JoinerB",
                     "adapter_config": {
                         "enabled": True,
+                        "adapter_type": "local_udp_bridge",
                         "bind_port": 0,
                     },
                 })
@@ -423,6 +600,103 @@ class TestSessionManager(unittest.TestCase):
 
         for key in ("relay_token", "core", "loop", "transport", "socket", "thread", "task"):
             self.assertFalse(_dict_contains_key(payload, key), key)
+
+    def test_adapter_bind_calls_manager(self):
+        secondary = FakeSecondaryIpManager(
+            AdapterBindDecision(
+                bind_host="192.168.1.250",
+                secondary_ip_enabled=True,
+                fallback_used=False,
+            )
+        )
+        mgr = SessionManager(secondary_ip_manager=secondary)
+
+        info = mgr.create_session({
+            "server_host": "127.0.0.1",
+            "player_name": "CreatorA",
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "local_udp_bridge",
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "target_port": 27015,
+                "secondary_ip_request": {
+                    "ip_address": "192.168.1.250",
+                    "interface_hint": "Ethernet",
+                    "prefix_length": 28,
+                },
+            },
+        })
+
+        self.assertEqual(
+            secondary.calls,
+            [("192.168.1.250", "127.0.0.1", "Ethernet", 28)],
+        )
+        self.assertEqual(info.adapter_config.bind_host, "192.168.1.250")
+        self.assertTrue(info.adapter_config.secondary_ip_enabled)
+        self.assertTrue(info.secondary_ip_enabled)
+        self.assertFalse(info.secondary_ip_fallback_used)
+        self.assertEqual(info.to_dict()["secondary_ip_enabled"], True)
+
+    def test_fallback_used_if_non_admin(self):
+        secondary = FakeSecondaryIpManager(
+            AdapterBindDecision(
+                bind_host="127.0.0.1",
+                secondary_ip_enabled=False,
+                fallback_used=True,
+                warning="administrator privileges are required",
+            )
+        )
+        mgr = SessionManager(secondary_ip_manager=secondary)
+
+        info = mgr.create_session({
+            "server_host": "127.0.0.1",
+            "player_name": "CreatorA",
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "local_udp_bridge",
+                "bind_host": "127.0.0.1",
+                "secondary_ip_request": {"ip_address": "192.168.1.250"},
+            },
+        })
+
+        self.assertEqual(info.adapter_config.bind_host, "127.0.0.1")
+        self.assertFalse(info.secondary_ip_enabled)
+        self.assertTrue(info.secondary_ip_fallback_used)
+        self.assertEqual(
+            info.secondary_ip_warning,
+            "administrator privileges are required",
+        )
+
+    def test_warning_propagated(self):
+        secondary = FakeSecondaryIpManager(
+            AdapterBindDecision(
+                bind_host="127.0.0.1",
+                secondary_ip_enabled=False,
+                fallback_used=True,
+                warning="failed to add secondary IP: mock failure",
+            )
+        )
+        mgr = SessionManager(secondary_ip_manager=secondary)
+
+        info = mgr.join_session({
+            "server_host": "127.0.0.1",
+            "room_id": "ABC234",
+            "player_name": "JoinerB",
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "local_udp_bridge",
+                "secondary_ip_request": {"ip_address": "192.168.1.250"},
+            },
+        })
+
+        data = info.to_dict()
+        self.assertFalse(data["secondary_ip_enabled"])
+        self.assertTrue(data["secondary_ip_fallback_used"])
+        self.assertEqual(
+            data["secondary_ip_warning"],
+            "failed to add secondary IP: mock failure",
+        )
 
     # ------------------------------------------------------------------
     # create_session
@@ -481,6 +755,57 @@ class TestSessionManager(unittest.TestCase):
 
         self.assertFalse(info.force_relay)
         self.assertFalse(info.to_dict()["force_relay"])
+
+    def test_participant_dto_serializes_public_fields(self):
+        participant = ParticipantDto(
+            player_id="p_alice000001",
+            player_name="Alice",
+            is_host=True,
+        )
+
+        self.assertEqual(participant.to_dict(), {
+            "player_id": "p_alice000001",
+            "player_name": "Alice",
+            "is_host": True,
+        })
+
+    def test_session_info_serializes_v2_room_fields(self):
+        info = SessionInfo(
+            session_id="s_abc123def456",
+            role="create",
+            status="relay_ready",
+            room_id="V2ROOM",
+            player_name="Alice",
+            server_host="127.0.0.1",
+            server_port=9000,
+            server_udp_port=9001,
+            created_at=time.time(),
+            updated_at=time.time(),
+            stats=SessionStats(),
+            player_id="p_alice000001",
+            protocol_version=2,
+            max_players=4,
+            participant_count=1,
+            participants=[ParticipantDto.from_dict(_alice_participant())],
+            host_player_id="p_alice000001",
+            last_room_event="room_ready",
+            room_ready=True,
+            relay_ready=True,
+            relay_token_available=True,
+            relay_target_host="203.0.113.10",
+            relay_target_port=9001,
+        )
+        data = info.to_dict()
+
+        self.assertEqual(data["protocol_version"], 2)
+        self.assertEqual(data["max_players"], 4)
+        self.assertEqual(data["participant_count"], 1)
+        self.assertEqual(data["participants"], [_alice_participant()])
+        self.assertEqual(data["host_player_id"], "p_alice000001")
+        self.assertTrue(data["room_ready"])
+        self.assertTrue(data["relay_ready"])
+        self.assertTrue(data["relay_token_available"])
+        self.assertNotIn("relay_token", data)
 
     def test_create_session_rejects_non_bool_force_relay(self):
         with self.assertRaises(BackendError) as ctx:
@@ -569,6 +894,175 @@ class TestSessionManager(unittest.TestCase):
         room_created = [e for e in logs if e.type == "room_created"][0]
 
         self.assertEqual(room_created.data["room_id"], info.room_id)
+
+    def test_room_created_event_with_participants_updates_session_state(self):
+        runners = []
+
+        def factory():
+            runner = ManualV2RoomRunner()
+            runners.append(runner)
+            return runner
+
+        mgr = SessionManager(runner_factory=factory)
+        info = mgr.create_session({
+            "server_host": "192.168.1.10",
+            "player_name": "Alice",
+        })
+
+        self.assertEqual(info.protocol_version, 2)
+        self.assertEqual(info.max_players, 4)
+        self.assertEqual(info.participant_count, 1)
+        self.assertEqual(
+            [participant.to_dict() for participant in info.participants],
+            [_alice_participant()],
+        )
+        self.assertEqual(info.player_id, "p_alice000001")
+        self.assertEqual(info.host_player_id, "p_alice000001")
+
+    def test_room_joined_event_with_participants_updates_session_state(self):
+        runners = []
+
+        def factory():
+            runner = ManualV2RoomRunner()
+            runners.append(runner)
+            return runner
+
+        mgr = SessionManager(runner_factory=factory)
+        info = mgr.join_session({
+            "server_host": "192.168.1.10",
+            "room_id": "V2ROOM",
+            "player_name": "Bob",
+        })
+
+        self.assertEqual(info.protocol_version, 2)
+        self.assertEqual(info.max_players, 4)
+        self.assertEqual(info.participant_count, 2)
+        self.assertEqual(
+            [participant.to_dict() for participant in info.participants],
+            [_alice_participant(), _bob_participant()],
+        )
+        self.assertEqual(info.player_id, "p_bob00000002")
+
+    def test_room_updated_full_snapshot_overwrites_participants(self):
+        runners = []
+
+        def factory():
+            runner = ManualV2RoomRunner()
+            runners.append(runner)
+            return runner
+
+        mgr = SessionManager(runner_factory=factory)
+        info = mgr.create_session({
+            "server_host": "192.168.1.10",
+            "player_name": "Alice",
+        })
+
+        runners[0].emit("room_updated", "Room updated", {
+            "room_id": "V2ROOM",
+            "event": "participant_joined",
+            "participant_count": 2,
+            "max_players": 4,
+            "host_player_id": "p_alice000001",
+            "participants": [_alice_participant(), _bob_participant()],
+            "server_time": 1716192000.0,
+        })
+        fetched = mgr.get_session(info.session_id)
+
+        self.assertEqual(fetched.last_room_event, "participant_joined")
+        self.assertEqual(fetched.participant_count, 2)
+        self.assertEqual(
+            [participant.to_dict() for participant in fetched.participants],
+            [_alice_participant(), _bob_participant()],
+        )
+        self.assertEqual(fetched.host_player_id, "p_alice000001")
+        self.assertEqual(fetched.server_time, 1716192000.0)
+
+    def test_participant_left_event_alone_does_not_corrupt_participants(self):
+        runners = []
+
+        def factory():
+            runner = ManualV2RoomRunner()
+            runners.append(runner)
+            return runner
+
+        mgr = SessionManager(runner_factory=factory)
+        info = mgr.create_session({
+            "server_host": "192.168.1.10",
+            "player_name": "Alice",
+        })
+        runners[0].emit("room_updated", "Room updated", {
+            "room_id": "V2ROOM",
+            "event": "participant_joined",
+            "participant_count": 2,
+            "max_players": 4,
+            "host_player_id": "p_alice000001",
+            "participants": [_alice_participant(), _bob_participant()],
+        })
+
+        runners[0].emit("participant_left", "Participant left", {
+            "room_id": "V2ROOM",
+            "player_id": "p_bob00000002",
+        })
+        fetched = mgr.get_session(info.session_id)
+
+        self.assertEqual(fetched.last_room_event, "participant_left")
+        self.assertEqual(fetched.participant_count, 2)
+        self.assertEqual(
+            [participant.to_dict() for participant in fetched.participants],
+            [_alice_participant(), _bob_participant()],
+        )
+
+    def test_room_ready_and_closed_events_update_readable_status(self):
+        runners = []
+
+        def factory():
+            runner = ManualV2RoomRunner()
+            runners.append(runner)
+            return runner
+
+        mgr = SessionManager(runner_factory=factory)
+        info = mgr.create_session({
+            "server_host": "192.168.1.10",
+            "player_name": "Alice",
+        })
+
+        runners[0].emit("room_ready", "Room ready", {"room_id": "V2ROOM"})
+        self.assertTrue(mgr.get_session(info.session_id).room_ready)
+        self.assertEqual(mgr.get_session(info.session_id).status, "room_ready")
+
+        runners[0].emit("room_closed", "Room closed", {"room_id": "V2ROOM"})
+        fetched = mgr.get_session(info.session_id)
+        self.assertTrue(fetched.room_closed)
+        self.assertEqual(fetched.status, "closed")
+        self.assertEqual(fetched.last_room_event, "room_closed")
+
+    def test_relay_ready_updates_target_without_raw_token(self):
+        runners = []
+
+        def factory():
+            runner = ManualV2RoomRunner()
+            runners.append(runner)
+            return runner
+
+        mgr = SessionManager(runner_factory=factory)
+        info = mgr.create_session({
+            "server_host": "192.168.1.10",
+            "player_name": "Alice",
+        })
+
+        runners[0].emit("relay_ready", "Relay path ready", {
+            "room_id": "V2ROOM",
+            "relay_token_available": True,
+            "relay_target_host": "203.0.113.10",
+            "relay_target_port": 9001,
+        })
+        data = mgr.get_session(info.session_id).to_dict()
+
+        self.assertTrue(data["relay_ready"])
+        self.assertTrue(data["relay_token_available"])
+        self.assertEqual(data["relay_target_host"], "203.0.113.10")
+        self.assertEqual(data["relay_target_port"], 9001)
+        self.assertFalse(_dict_contains_key(data, "relay_token"))
 
     def test_create_session_session_id_format(self):
         info = self.mgr.create_session({
@@ -1004,6 +1498,7 @@ class TestSessionManager(unittest.TestCase):
             "player_name": "JoinerB",
             "adapter_config": {
                 "enabled": True,
+                "adapter_type": "local_udp_bridge",
                 "bind_port": 40101,
             },
         })
@@ -1012,6 +1507,48 @@ class TestSessionManager(unittest.TestCase):
         self.assertEqual(d["status"], "stopped")
         self.assertEqual(d["bind_port"], 40101)
         self.assertNotIn("target_port", d)
+
+    def test_join_bundle_without_game_server_port_starts_local_rules(self):
+        info = self.mgr.join_session({
+            "server_host": "192.168.1.10",
+            "room_id": "RN4Y78",
+            "player_name": "JoinerB",
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "bundle",
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "target_host": "127.0.0.1",
+                "target_port": 27015,
+            },
+        })
+
+        data = info.to_dict()
+        status = data["adapter_status"]
+        diagnostics = status["payload_diagnostics"]
+
+        self.assertEqual(info.status, "running")
+        self.assertNotIn("game_server_port", data)
+        self.assertEqual(status["status"], "ready")
+        self.assertEqual(status["adapter_type"], "bundle")
+        self.assertEqual(status["target_port"], 27015)
+        self.assertGreater(status["bind_port"], 0)
+        self.assertEqual(
+            diagnostics["included_rule_kinds"],
+            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+        )
+        self.assertEqual(diagnostics["local_game_connection"]["host"], "127.0.0.1")
+        self.assertEqual(diagnostics["local_game_connection"]["port"], status["bind_port"])
+        self.assertEqual(len(diagnostics["rules"]), 3)
+        self.assertEqual(
+            [rule["kind"] for rule in diagnostics["rules"]],
+            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+        )
+        self.assertNotEqual(
+            diagnostics["rules"][2]["local_bind_port"],
+            status["bind_port"],
+        )
+        self.assertFalse(_dict_contains_value(data, "RN4Y78", only_port_keys=True))
 
     def test_join_session_invalid_game_server_port_negative(self):
         with self.assertRaises(BackendError) as ctx:
@@ -1070,6 +1607,7 @@ class TestSessionManager(unittest.TestCase):
             "player_name": "CreatorA",
             "adapter_config": {
                 "enabled": True,
+                "adapter_type": "local_udp_bridge",
             },
         })
 
@@ -1078,6 +1616,34 @@ class TestSessionManager(unittest.TestCase):
         self.assertEqual(stopped.status, "stopped")
         self.assertEqual(stopped.adapter_status.status, "stopped")
         self.assertEqual(stopped.to_dict()["adapter_status"]["status"], "stopped")
+
+    def test_stop_join_bundle_session_cleans_local_resources_only(self):
+        info = self.mgr.join_session({
+            "server_host": "192.168.1.10",
+            "room_id": "ABC234",
+            "player_name": "JoinerB",
+            "game_server_port": 27015,
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "bundle",
+                "bind_host": "127.0.0.1",
+                "bind_port": 0,
+                "target_host": "127.0.0.1",
+                "target_port": 27015,
+            },
+        })
+
+        stopped = self.mgr.stop_session(info.session_id)
+        logs = self.mgr.get_logs(info.session_id)
+        types = [event.type for event in logs]
+
+        self.assertEqual(stopped.role, "join")
+        self.assertEqual(stopped.status, "stopped")
+        self.assertEqual(stopped.adapter_status.status, "stopped")
+        self.assertIn("adapter_stopped", types)
+        self.assertIn("session_stopped", types)
+        self.assertNotIn("room_closed", types)
+        self.assertFalse(stopped.room_closed)
 
     def test_stop_already_stopped_returns_info_without_duplicate_events(self):
         info = self.mgr.create_session({
@@ -1125,6 +1691,7 @@ class TestSessionManager(unittest.TestCase):
                     "player_name": "CreatorA",
                     "adapter_config": {
                         "enabled": True,
+                        "adapter_type": "local_udp_bridge",
                         "bind_port": 0,
                     },
                 })

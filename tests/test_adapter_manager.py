@@ -9,7 +9,13 @@ import time
 import unittest
 
 from backend.adapter_manager import AdapterManager
-from backend.models import AdapterConfig
+from backend.models import (
+    BUNDLE_STATUS_FAILED,
+    BUNDLE_STATUS_RUNNING,
+    BUNDLE_STATUS_STOPPED,
+    AdapterConfig,
+    BundleResult,
+)
 from adapters.transport import FakePairTransport, make_fake_pair
 
 
@@ -20,6 +26,46 @@ class CloseTrackingTransport(FakePairTransport):
 
     def close(self):
         self.close_count += 1
+
+
+class RecordingBundleRunner:
+    def __init__(self, start_result=None):
+        self.start_result = start_result
+        self.bundle = None
+        self.stop_count = 0
+
+    def start(self, bundle):
+        self.bundle = bundle
+        if self.start_result is not None:
+            return self.start_result
+        return BundleResult(
+            bundle_id=bundle.id,
+            status=BUNDLE_STATUS_RUNNING,
+            started_rule_ids=[rule.id for rule in bundle.rules],
+        )
+
+    def stop(self):
+        self.stop_count += 1
+        return BundleResult(
+            bundle_id=self.bundle.id if self.bundle is not None else "",
+            status=BUNDLE_STATUS_STOPPED,
+            stopped_rule_ids=[
+                rule.id for rule in reversed(self.bundle.rules)
+            ] if self.bundle is not None else [],
+        )
+
+
+def _bundle_transport_factory(session_id, config):
+    local, _ = make_fake_pair()
+    return local
+
+
+def _udp_config(**kwargs):
+    return AdapterConfig(
+        enabled=True,
+        adapter_type="local_udp_bridge",
+        **kwargs,
+    )
 
 
 def _free_udp_port() -> int:
@@ -37,6 +83,93 @@ def _assert_can_bind_udp(port: int) -> None:
         sock.bind(("127.0.0.1", port))
     finally:
         sock.close()
+
+
+class TcpUdpSink:
+    def __init__(self):
+        self.tcp_payloads = []
+        self.udp_payloads = []
+        self._stop = threading.Event()
+        self._tcp_event = threading.Event()
+        self._udp_event = threading.Event()
+        self._tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._tcp_sock.bind(("127.0.0.1", 0))
+        self.port = self._tcp_sock.getsockname()[1]
+        self._tcp_sock.listen()
+        self._tcp_sock.settimeout(0.2)
+        self._udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        self._udp_sock.bind(("127.0.0.1", self.port))
+        self._udp_sock.settimeout(0.2)
+        self._tcp_thread = threading.Thread(target=self._tcp_loop, daemon=True)
+        self._udp_thread = threading.Thread(target=self._udp_loop, daemon=True)
+        self._tcp_thread.start()
+        self._udp_thread.start()
+
+    def stop(self):
+        self._stop.set()
+        for sock in (self._tcp_sock, self._udp_sock):
+            try:
+                sock.close()
+            except OSError:
+                pass
+        self._tcp_thread.join(timeout=1.0)
+        self._udp_thread.join(timeout=1.0)
+
+    def wait_for_tcp(self, count: int, timeout: float = 2.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if len(self.tcp_payloads) >= count:
+                return True
+            self._tcp_event.wait(timeout=0.05)
+            self._tcp_event.clear()
+        return len(self.tcp_payloads) >= count
+
+    def wait_for_udp(self, count: int, timeout: float = 2.0) -> bool:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if len(self.udp_payloads) >= count:
+                return True
+            self._udp_event.wait(timeout=0.05)
+            self._udp_event.clear()
+        return len(self.udp_payloads) >= count
+
+    def _tcp_loop(self):
+        while not self._stop.is_set():
+            try:
+                conn, _addr = self._tcp_sock.accept()
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            with conn:
+                chunks = []
+                while True:
+                    data = conn.recv(4096)
+                    if not data:
+                        break
+                    chunks.append(data)
+                self.tcp_payloads.append(b"".join(chunks))
+                self._tcp_event.set()
+
+    def _udp_loop(self):
+        while not self._stop.is_set():
+            try:
+                data, _addr = self._udp_sock.recvfrom(4096)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            self.udp_payloads.append(data)
+            self._udp_event.set()
+
+
+def _send_tcp(host: str, port: int, payload: bytes) -> None:
+    with socket.create_connection((host, port), timeout=2.0) as sock:
+        sock.sendall(payload)
+        try:
+            sock.shutdown(socket.SHUT_WR)
+        except OSError:
+            pass
 
 
 class AdapterManagerTests(unittest.TestCase):
@@ -85,7 +218,7 @@ class AdapterManagerTests(unittest.TestCase):
         self.assertIsNone(status.error)
 
     def test_snapshot_returns_configured_status(self):
-        configured = self.manager.configure("s_test", AdapterConfig(enabled=True))
+        configured = self.manager.configure("s_test", _udp_config())
 
         self.assertIs(self.manager.snapshot("s_test"), configured)
 
@@ -104,7 +237,7 @@ class AdapterManagerTests(unittest.TestCase):
         self.assertEqual(started.status, "disabled")
 
     def test_start_enabled_does_not_transition_to_ready(self):
-        configured = self.manager.configure("s_test", AdapterConfig(enabled=True))
+        configured = self.manager.configure("s_test", _udp_config())
 
         started = self.manager.start("s_test")
 
@@ -115,7 +248,7 @@ class AdapterManagerTests(unittest.TestCase):
         manager = AdapterManager(
             transport_factory=lambda session_id, config: FakePairTransport(),
         )
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
 
         status = manager.start("s_test")
         try:
@@ -144,7 +277,7 @@ class AdapterManagerTests(unittest.TestCase):
         manager = AdapterManager(
             transport_factory=lambda session_id, config: FakePairTransport(),
         )
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
 
         status = manager.start("s_test")
         try:
@@ -156,7 +289,7 @@ class AdapterManagerTests(unittest.TestCase):
     def test_attach_transport_stores_opaque_transport_for_start(self):
         transport = FakePairTransport()
         manager = AdapterManager()
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
         manager.attach_transport("s_test", transport)
 
         status = manager.start("s_test")
@@ -188,7 +321,7 @@ class AdapterManagerTests(unittest.TestCase):
     def test_stop_closes_attached_transport_if_close_exists(self):
         transport = CloseTrackingTransport()
         manager = AdapterManager()
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
         manager.attach_transport("s_test", transport)
         manager.start("s_test")
 
@@ -199,7 +332,7 @@ class AdapterManagerTests(unittest.TestCase):
     def test_stop_does_not_require_transport_close_method(self):
         transport = FakePairTransport()
         manager = AdapterManager()
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
         manager.attach_transport("s_test", transport)
         manager.start("s_test")
 
@@ -210,7 +343,7 @@ class AdapterManagerTests(unittest.TestCase):
     def test_repeated_stop_closes_attached_transport_at_most_once(self):
         transport = CloseTrackingTransport()
         manager = AdapterManager()
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
         manager.attach_transport("s_test", transport)
         manager.start("s_test")
 
@@ -223,7 +356,7 @@ class AdapterManagerTests(unittest.TestCase):
         manager = AdapterManager(
             transport_factory=lambda session_id, config: FakePairTransport(),
         )
-        manager.configure("s_test", AdapterConfig(enabled=True, bind_port=0))
+        manager.configure("s_test", _udp_config(bind_port=0))
 
         status = manager.start("s_test")
         try:
@@ -237,7 +370,7 @@ class AdapterManagerTests(unittest.TestCase):
         manager = AdapterManager(
             transport_factory=lambda session_id, config: FakePairTransport(),
         )
-        manager.configure("s_test", AdapterConfig(enabled=True, bind_port=port))
+        manager.configure("s_test", _udp_config(bind_port=port))
 
         status = manager.start("s_test")
         try:
@@ -250,7 +383,7 @@ class AdapterManagerTests(unittest.TestCase):
         manager = AdapterManager(
             transport_factory=lambda session_id, config: FakePairTransport(),
         )
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
         manager.start("s_test")
 
         status = manager.snapshot("s_test")
@@ -273,7 +406,7 @@ class AdapterManagerTests(unittest.TestCase):
         manager = AdapterManager(
             transport_factory=lambda session_id, config: FakePairTransport(),
         )
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
         ready = manager.start("s_test")
         port = ready.bind_port
 
@@ -286,7 +419,7 @@ class AdapterManagerTests(unittest.TestCase):
         manager = AdapterManager(
             transport_factory=lambda session_id, config: FakePairTransport(),
         )
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
         manager.start("s_test")
 
         first = manager.stop("s_test")
@@ -303,6 +436,7 @@ class AdapterManagerTests(unittest.TestCase):
             "s_test",
             AdapterConfig(
                 enabled=True,
+                adapter_type="local_udp_bridge",
                 bind_host="203.0.113.1",
                 bind_port=40100,
             ),
@@ -319,7 +453,7 @@ class AdapterManagerTests(unittest.TestCase):
             raise RuntimeError("test transport unavailable")
 
         manager = AdapterManager(transport_factory=fail_factory)
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
 
         status = manager.start("s_test")
 
@@ -327,9 +461,220 @@ class AdapterManagerTests(unittest.TestCase):
         self.assertEqual(status.error["code"], "ADAPTER_TRANSPORT_FAILED")
         self.assertIn("test transport unavailable", status.error["message"])
 
+    def test_bundle_builds_tcp_and_udp_rules_with_shared_config(self):
+        runner = RecordingBundleRunner()
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+            bundle_runner_factory=lambda: runner,
+        )
+        manager.configure(
+            "s_test",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_host="127.0.0.1",
+                bind_port=41001,
+                target_host="127.0.0.1",
+                target_port=27015,
+            ),
+        )
+
+        status = manager.start("s_test")
+
+        self.assertEqual(status.status, "ready")
+        self.assertEqual(status.adapter_type, "bundle")
+        self.assertEqual(status.bind_port, 41001)
+        self.assertEqual(
+            [rule.kind for rule in runner.bundle.rules],
+            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+        )
+        for rule in runner.bundle.rules[:2]:
+            self.assertEqual(rule.config, {
+                "local_bind_host": "127.0.0.1",
+                "local_bind_port": 41001,
+                "remote_target_host": "127.0.0.1",
+                "remote_target_port": 27015,
+            })
+        broadcast_rule = runner.bundle.rules[2]
+        self.assertEqual(
+            broadcast_rule.config["local_bind_host"],
+            "127.0.0.1",
+        )
+        self.assertNotEqual(
+            broadcast_rule.config["local_bind_port"],
+            41001,
+        )
+        self.assertEqual(
+            broadcast_rule.config["remote_target_port"],
+            27015,
+        )
+
+        stopped = manager.stop("s_test")
+        self.assertEqual(stopped.status, "stopped")
+        self.assertEqual(runner.stop_count, 1)
+        self.assertEqual(
+            stopped.payload_diagnostics["stopped_rule_ids"],
+            [
+                "s_test_udp_broadcast",
+                "s_test_udp",
+                "s_test_tcp",
+            ],
+        )
+
+    def test_bundle_start_failure_maps_to_structured_adapter_error(self):
+        result = BundleResult(
+            bundle_id="s_test_bundle",
+            status=BUNDLE_STATUS_FAILED,
+            failed_rule_id="s_test_udp_broadcast",
+            failed_rule_kind="udp_broadcast_forward",
+            error_detail="test broadcast failure",
+        )
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+            bundle_runner_factory=lambda: RecordingBundleRunner(result),
+        )
+        manager.configure(
+            "s_test",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_port=41002,
+                target_port=27015,
+            ),
+        )
+
+        status = manager.start("s_test")
+
+        self.assertEqual(status.status, "error")
+        self.assertEqual(status.error["code"], "BUNDLE_START_FAILED")
+        self.assertEqual(status.error["message"], "test broadcast failure")
+        self.assertEqual(
+            status.payload_diagnostics["failed_rule_kind"],
+            "udp_broadcast_forward",
+        )
+
+    def test_real_bundle_uses_same_ephemeral_tcp_udp_port_and_releases_it(self):
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+        )
+        manager.configure(
+            "s_test",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_port=0,
+                target_port=27015,
+            ),
+        )
+
+        ready = manager.start("s_test")
+        self.assertEqual(ready.status, "ready")
+        self.assertGreater(ready.bind_port, 0)
+        port = ready.bind_port
+
+        stopped = manager.stop("s_test")
+
+        self.assertEqual(stopped.status, "stopped")
+        tcp_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            tcp_sock.bind(("127.0.0.1", port))
+            udp_sock.bind(("127.0.0.1", port))
+        finally:
+            udp_sock.close()
+            tcp_sock.close()
+
+    def test_local_three_user_bundle_tcp_udp_paths_and_rule_status(self):
+        sink = TcpUdpSink()
+        self.addCleanup(sink.stop)
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+        )
+        session_ids = ["s_host", "s_join1", "s_join2"]
+        ready_statuses = []
+
+        for session_id in session_ids:
+            manager.configure(
+                session_id,
+                AdapterConfig(
+                    enabled=True,
+                    adapter_type="bundle",
+                    bind_host="127.0.0.1",
+                    bind_port=0,
+                    target_host="127.0.0.1",
+                    target_port=sink.port,
+                ),
+            )
+            status = manager.start(session_id)
+            self.assertEqual(status.status, "ready")
+            ready_statuses.append(status)
+
+        bind_ports = [status.bind_port for status in ready_statuses]
+        self.assertEqual(len(set(bind_ports)), 3)
+        self.assertTrue(all(port > 0 for port in bind_ports))
+
+        for index, status in enumerate(ready_statuses):
+            tcp_payload = f"tcp-{index}".encode("ascii")
+            udp_payload = f"udp-{index}".encode("ascii")
+            _send_tcp(status.bind_host, status.bind_port, tcp_payload)
+            udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                udp_sock.sendto(udp_payload, (status.bind_host, status.bind_port))
+            finally:
+                udp_sock.close()
+
+        self.assertTrue(sink.wait_for_tcp(3))
+        self.assertTrue(sink.wait_for_udp(3))
+
+        broadcast_ports = []
+        for session_id, status in zip(session_ids, ready_statuses):
+            snapshot = manager.snapshot(session_id)
+            diagnostics = snapshot.payload_diagnostics
+            rules = diagnostics["rules"]
+            self.assertEqual(
+                [rule["kind"] for rule in rules],
+                ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+            )
+            tcp_rule, udp_rule, broadcast_rule = rules
+            self.assertEqual(tcp_rule["local_bind_port"], status.bind_port)
+            self.assertEqual(udp_rule["local_bind_port"], status.bind_port)
+            self.assertEqual(tcp_rule["remote_target_port"], sink.port)
+            self.assertEqual(udp_rule["remote_target_port"], sink.port)
+            self.assertIsInstance(tcp_rule["local_bind_port"], int)
+            self.assertIsInstance(udp_rule["local_bind_port"], int)
+            self.assertIsInstance(broadcast_rule["local_bind_port"], int)
+            self.assertNotEqual(broadcast_rule["local_bind_port"], status.bind_port)
+            broadcast_ports.append(broadcast_rule["local_bind_port"])
+            self.assertGreaterEqual(
+                tcp_rule["stats"]["bytes_forwarded_to_target"],
+                len(b"tcp-0"),
+            )
+            self.assertGreaterEqual(udp_rule["stats"]["received_packets"], 1)
+            self.assertGreater(snapshot.counters.bytes_from_game, 0)
+            self.assertGreater(snapshot.counters.packets_from_game, 0)
+
+        self.assertEqual(len(set(broadcast_ports)), 3)
+
+    def test_bundle_without_broadcast_transport_fails_clearly(self):
+        manager = AdapterManager()
+        manager.configure(
+            "s_test",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                target_port=27015,
+            ),
+        )
+
+        status = manager.start("s_test")
+
+        self.assertEqual(status.status, "error")
+        self.assertEqual(status.error["code"], "BUNDLE_START_FAILED")
+        self.assertIn("requires an available bundle transport", status.error["message"])
+
     def test_start_without_transport_factory_enabled_config_stays_stopped(self):
         manager = AdapterManager()
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
 
         status = manager.start("s_test")
 
@@ -347,7 +692,7 @@ class AdapterManagerTests(unittest.TestCase):
 
         t2.set_receive_callback(on_receive)
         manager = AdapterManager(transport_factory=lambda session_id, config: t1)
-        manager.configure("s_test", AdapterConfig(enabled=True))
+        manager.configure("s_test", _udp_config())
         status = manager.start("s_test")
         self.assertEqual(status.status, "ready")
 
@@ -382,14 +727,14 @@ class AdapterManagerTests(unittest.TestCase):
         self.assertEqual(configured.status, "disabled")
 
     def test_stop_enabled_stopped_is_idempotent(self):
-        configured = self.manager.configure("s_test", AdapterConfig(enabled=True))
+        configured = self.manager.configure("s_test", _udp_config())
 
         self.assertIs(self.manager.stop("s_test"), configured)
         self.assertIs(self.manager.stop("s_test"), configured)
         self.assertEqual(configured.status, "stopped")
 
     def test_reconfigure_none_clears_status(self):
-        self.manager.configure("s_test", AdapterConfig(enabled=True))
+        self.manager.configure("s_test", _udp_config())
 
         self.assertIsNone(self.manager.configure("s_test", None))
         self.assertIsNone(self.manager.snapshot("s_test"))

@@ -1054,9 +1054,12 @@ class S2PassClientCore:
 
         # --- Step 6: Wait RELAY_ENABLED (old L441-448) ---
         try:
-            await asyncio.wait_for(
-                self._relay_enabled_event.wait(), timeout=RELAY_ENABLED_TIMEOUT
-            )
+            if self._should_wait_for_relay_without_timeout():
+                await self._relay_enabled_event.wait()
+            else:
+                await asyncio.wait_for(
+                    self._relay_enabled_event.wait(), timeout=RELAY_ENABLED_TIMEOUT
+                )
         except asyncio.TimeoutError:
             self._emit(EVT_TIMEOUT,
                        f"RELAY_ENABLED not received within {RELAY_ENABLED_TIMEOUT}s")
@@ -1097,6 +1100,14 @@ class S2PassClientCore:
             self._stats_reporter_task = asyncio.create_task(self._stats_reporter())
             while True:
                 await asyncio.sleep(3600)
+
+    def _should_wait_for_relay_without_timeout(self) -> bool:
+        """Keep backend-owned v2 host sessions alive while rooms are WAITING."""
+        return (
+            self.config.is_payload_mode
+            and self.config.role == "create"
+            and self.protocol_version == 2
+        )
 
     # ===================================================================
     # Cleanup — mirrors old CLIClient.cleanup() exactly (old L474-510)

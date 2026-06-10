@@ -47,6 +47,8 @@ class GenericUdpBroadcastForwardAdapter(AdapterBase):
         max_hop_count: int = DEFAULT_MAX_HOP_COUNT,
         recent_ttl_seconds: float = DEFAULT_RECENT_TTL_SECONDS,
         recent_cache_limit: int = DEFAULT_RECENT_CACHE_LIMIT,
+        route_responses_to_last_sender: bool = False,
+        strict_target_port_match: bool = True,
     ):
         super().__init__(profile)
         self.transport = transport
@@ -57,6 +59,8 @@ class GenericUdpBroadcastForwardAdapter(AdapterBase):
         self.max_hop_count = max_hop_count
         self.recent_ttl_seconds = recent_ttl_seconds
         self.recent_cache_limit = recent_cache_limit
+        self.route_responses_to_last_sender = route_responses_to_last_sender
+        self.strict_target_port_match = strict_target_port_match
 
         self._validate_config()
 
@@ -172,6 +176,7 @@ class GenericUdpBroadcastForwardAdapter(AdapterBase):
                 "dropped_recent_packet": self.dropped_recent_packet,
                 "dropped_local_loop": self.dropped_local_loop,
                 "last_local_sender_addr": self.last_local_sender_addr,
+                "route_responses_to_last_sender": self.route_responses_to_last_sender,
                 "last_error": self.last_error,
             }
 
@@ -287,7 +292,10 @@ class GenericUdpBroadcastForwardAdapter(AdapterBase):
             self._remember_local_payload_locked(raw_payload)
             is_running = self._is_running
             sock = self.sock
-            target = (self.target_host, int(self.target_port))
+            if self.route_responses_to_last_sender and self.last_local_sender_addr is not None:
+                target = self.last_local_sender_addr
+            else:
+                target = (self.target_host, int(self.target_port))
 
         if not is_running or sock is None:
             return
@@ -327,7 +335,9 @@ class GenericUdpBroadcastForwardAdapter(AdapterBase):
                 raise ValueError("packet_id is required")
             if not isinstance(hop_count, int):
                 raise ValueError("hop_count must be an integer")
-            if not isinstance(target_port, int) or target_port != int(self.target_port):
+            if not isinstance(target_port, int):
+                raise ValueError("target_port must be an integer")
+            if self.strict_target_port_match and target_port != int(self.target_port):
                 raise ValueError("target_port must match configured target_port")
             if not isinstance(payload_b64, str):
                 raise ValueError("payload_b64 is required")

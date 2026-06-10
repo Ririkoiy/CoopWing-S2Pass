@@ -590,6 +590,7 @@ class TestSessionManager(unittest.TestCase):
                         "enabled": True,
                         "adapter_type": "local_udp_bridge",
                         "bind_port": 0,
+                        "target_port": 27015,
                     },
                 })
                 payload = {
@@ -686,6 +687,7 @@ class TestSessionManager(unittest.TestCase):
             "adapter_config": {
                 "enabled": True,
                 "adapter_type": "local_udp_bridge",
+                "target_port": 27015,
                 "secondary_ip_request": {"ip_address": "192.168.1.250"},
             },
         })
@@ -794,6 +796,9 @@ class TestSessionManager(unittest.TestCase):
             relay_token_available=True,
             relay_target_host="203.0.113.10",
             relay_target_port=9001,
+            peer_endpoint_host="198.51.100.44",
+            peer_endpoint_port=42001,
+            peer_endpoint_source="peer_info",
         )
         data = info.to_dict()
 
@@ -805,6 +810,9 @@ class TestSessionManager(unittest.TestCase):
         self.assertTrue(data["room_ready"])
         self.assertTrue(data["relay_ready"])
         self.assertTrue(data["relay_token_available"])
+        self.assertEqual(data["peer_endpoint_host"], "198.51.100.44")
+        self.assertEqual(data["peer_endpoint_port"], 42001)
+        self.assertEqual(data["peer_endpoint_source"], "peer_info")
         self.assertNotIn("relay_token", data)
 
     def test_create_session_rejects_non_bool_force_relay(self):
@@ -1064,6 +1072,38 @@ class TestSessionManager(unittest.TestCase):
         self.assertEqual(data["relay_target_port"], 9001)
         self.assertFalse(_dict_contains_key(data, "relay_token"))
 
+    def test_peer_info_event_updates_peer_endpoint_without_using_relay_target(self):
+        runners = []
+
+        def factory():
+            runner = ManualV2RoomRunner()
+            runners.append(runner)
+            return runner
+
+        mgr = SessionManager(runner_factory=factory)
+        info = mgr.create_session({
+            "server_host": "192.168.1.10",
+            "player_name": "Alice",
+        })
+
+        runners[0].emit("relay_ready", "Relay path ready", {
+            "room_id": "V2ROOM",
+            "relay_target_host": "203.0.113.10",
+            "relay_target_port": 9001,
+        })
+        runners[0].emit("peer_updated", "Peer endpoint updated", {
+            "room_id": "V2ROOM",
+            "peer_ip": "198.51.100.44",
+            "peer_port": 42001,
+        })
+        data = mgr.get_session(info.session_id).to_dict()
+
+        self.assertEqual(data["relay_target_host"], "203.0.113.10")
+        self.assertEqual(data["relay_target_port"], 9001)
+        self.assertEqual(data["peer_endpoint_host"], "198.51.100.44")
+        self.assertEqual(data["peer_endpoint_port"], 42001)
+        self.assertNotEqual(data["peer_endpoint_host"], data["relay_target_host"])
+
     def test_create_session_session_id_format(self):
         info = self.mgr.create_session({
             "server_host": "192.168.1.10",
@@ -1160,6 +1200,21 @@ class TestSessionManager(unittest.TestCase):
             "bytes_to_game": 0,
         })
         self.assertIsNone(d["error"])
+
+    def test_create_bundle_target_port_zero_is_invalid(self):
+        with self.assertRaises(BackendError) as ctx:
+            self.mgr.create_session({
+                "server_host": "192.168.1.10",
+                "player_name": "CreatorA",
+                "adapter_config": {
+                    "enabled": True,
+                    "adapter_type": "bundle",
+                    "target_port": 0,
+                },
+            })
+
+        self.assertEqual(ctx.exception.code, "INVALID_REQUEST")
+        self.assertEqual(ctx.exception.details["field"], "adapter_config.target_port")
 
     # ------------------------------------------------------------------
     # create_session validation
@@ -1467,14 +1522,16 @@ class TestSessionManager(unittest.TestCase):
         })
         self.assertIsNotNone(info.stats)
 
-    def test_join_without_adapter_config_omits_adapter_status(self):
+    def test_join_without_adapter_config_auto_derives_bundle_status(self):
         info = self.mgr.join_session({
             "server_host": "192.168.1.10",
             "room_id": "ABC234",
             "player_name": "JoinerB",
         })
-        self.assertIsNone(info.adapter_config)
-        self.assertNotIn("adapter_status", info.to_dict())
+        self.assertIsNotNone(info.adapter_config)
+        self.assertEqual(info.adapter_config.adapter_type, "bundle")
+        self.assertTrue(info.adapter_config.enabled)
+        self.assertIn("adapter_status", info.to_dict())
 
     def test_join_with_disabled_adapter_config_serializes_disabled(self):
         info = self.mgr.join_session({
@@ -1491,22 +1548,25 @@ class TestSessionManager(unittest.TestCase):
             "status": "disabled",
         })
 
-    def test_join_with_enabled_adapter_config_stores_passive_status(self):
-        info = self.mgr.join_session({
-            "server_host": "192.168.1.10",
-            "room_id": "ABC234",
-            "player_name": "JoinerB",
-            "adapter_config": {
-                "enabled": True,
-                "adapter_type": "local_udp_bridge",
-                "bind_port": 40101,
-            },
-        })
-        d = info.to_dict()["adapter_status"]
-        self.assertTrue(d["enabled"])
-        self.assertEqual(d["status"], "stopped")
-        self.assertEqual(d["bind_port"], 40101)
-        self.assertNotIn("target_port", d)
+    def test_join_udp_only_without_target_port_is_rejected(self):
+        with self.assertRaises(BackendError) as ctx:
+            self.mgr.join_session({
+                "server_host": "192.168.1.10",
+                "room_id": "ABC234",
+                "player_name": "JoinerB",
+                "adapter_config": {
+                    "enabled": True,
+                    "adapter_type": "local_udp_bridge",
+                    "bind_port": 40101,
+                },
+            })
+
+        self.assertEqual(ctx.exception.code, "INVALID_REQUEST")
+        self.assertIn("UDP Only Join requires", ctx.exception.message)
+        self.assertNotIn("room", ctx.exception.message.lower())
+        self.assertEqual(ctx.exception.details["field"], "adapter_config.target_port")
+        self.assertEqual(ctx.exception.details["adapter_type"], "local_udp_bridge")
+        self.assertIsNone(ctx.exception.details["target_port"])
 
     def test_join_bundle_without_game_server_port_starts_local_rules(self):
         info = self.mgr.join_session({
@@ -1519,7 +1579,7 @@ class TestSessionManager(unittest.TestCase):
                 "bind_host": "127.0.0.1",
                 "bind_port": 0,
                 "target_host": "127.0.0.1",
-                "target_port": 27015,
+                "target_port": 0,
             },
         })
 
@@ -1529,25 +1589,40 @@ class TestSessionManager(unittest.TestCase):
 
         self.assertEqual(info.status, "running")
         self.assertNotIn("game_server_port", data)
+        self.assertEqual(info.adapter_config.target_port, 0)
         self.assertEqual(status["status"], "ready")
         self.assertEqual(status["adapter_type"], "bundle")
-        self.assertEqual(status["target_port"], 27015)
+        self.assertEqual(status["target_port"], 0)
         self.assertGreater(status["bind_port"], 0)
         self.assertEqual(
             diagnostics["included_rule_kinds"],
-            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+            [
+                "tcp_forward",
+                "udp_forward",
+                "tcp_relay",
+                "udp_raw_bridge",
+                "udp_broadcast_forward",
+            ],
         )
         self.assertEqual(diagnostics["local_game_connection"]["host"], "127.0.0.1")
         self.assertEqual(diagnostics["local_game_connection"]["port"], status["bind_port"])
+        self.assertTrue(diagnostics["local_game_connection"]["tcp_available"])
+        self.assertTrue(diagnostics["local_game_connection"]["udp_available"])
         self.assertEqual(len(diagnostics["rules"]), 3)
         self.assertEqual(
             [rule["kind"] for rule in diagnostics["rules"]],
-            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+            ["tcp_relay", "udp_raw_bridge", "udp_broadcast_forward"],
         )
-        self.assertNotEqual(
-            diagnostics["rules"][2]["local_bind_port"],
+        self.assertNotEqual(diagnostics["udp_broadcast_bind_port"], status["bind_port"])
+        self.assertEqual(
+            diagnostics["rules"][1]["local_bind_port"],
             status["bind_port"],
         )
+        self.assertEqual(
+            diagnostics["discovery_helper_connection"]["port"],
+            diagnostics["udp_broadcast_bind_port"],
+        )
+        self.assertFalse(diagnostics["broadcast_only_forwarding"])
         self.assertFalse(_dict_contains_value(data, "RN4Y78", only_port_keys=True))
 
     def test_join_session_invalid_game_server_port_negative(self):
@@ -1971,6 +2046,7 @@ class TestSessionManager(unittest.TestCase):
             "room_joined",
             "relay_ready",
             "session_running",
+            "adapter_ready",
         ])
 
     def test_stop_session_uses_existing_runner(self):

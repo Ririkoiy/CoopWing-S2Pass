@@ -16,6 +16,24 @@ class FakeCore:
     def __init__(self):
         self.payload_callback: Optional[Callable[[bytes], None]] = None
         self.sent_payloads = []
+        self.payload_send_attempts = 0
+        self.payload_send_bytes = 0
+        self.udp_relay_send_attempts = 0
+        self.udp_relay_send_bytes = 0
+        self.udp_relay_send_noop_no_transport = 0
+        self.udp_relay_send_noop_no_target = 0
+        self.udp_relay_send_exceptions = 0
+        self.last_payload_send_error = None
+        self.relay_packets_received = 0
+        self.relay_payload_callback_calls = 0
+        self.relay_payload_callback_bytes = 0
+        self.relay_drop_not_relay_prefix = 0
+        self.relay_drop_invalid_header = 0
+        self.relay_drop_token_mismatch = 0
+        self.relay_drop_no_callback = 0
+        self.last_relay_receive_error = None
+        self.peer_ip = None
+        self.peer_port = None
 
     def set_payload_callback(self, callback: Callable[[bytes], None]) -> None:
         self.payload_callback = callback
@@ -135,6 +153,21 @@ class TestCoreTransportAdapter(unittest.TestCase):
         core.inject_payload(b"ignored")
         self.assertEqual(received, [])
         self.assertFalse(core_closed)
+
+    def test_payload_diagnostics_include_peer_endpoint_when_core_has_peer_info(self):
+        core = FakeCore()
+        core.peer_ip = "198.51.100.44"
+        core.peer_port = 42001
+        loop = FakeLoop()
+        adapter = CoreTransportAdapter(core, loop)
+
+        diagnostics = adapter.get_payload_diagnostics()
+
+        self.assertEqual(diagnostics["peer_endpoint"], {
+            "host": "198.51.100.44",
+            "port": 42001,
+            "source": "core_peer_info",
+        })
 
     def test_no_json_import_and_no_protocol_packet_construction(self):
         """CoreTransportAdapter does not import json and does not construct protocol packets."""

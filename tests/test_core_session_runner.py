@@ -468,6 +468,35 @@ class CoreSessionRunnerTests(unittest.TestCase):
         self.assertEqual(data["host_player_id"], "p_alice000001")
         self.assertTrue(runner.wait(timeout=1.0))
 
+    def test_peer_info_maps_to_backend_peer_updated_event(self):
+        fake_core = make_fake_core_class(
+            events=[
+                FakeCoreEvent(
+                    "PEER_INFO",
+                    data={
+                        "room_id": "V1ROOM",
+                        "peer_id": "p_bob00000002",
+                        "peer_name": "Bob",
+                        "peer_ip": "198.51.100.44",
+                        "peer_port": 42001,
+                    },
+                )
+            ],
+            finish_after_events=True,
+        )
+        runner = CoreSessionRunner(core_class=fake_core, config_class=FakeConfig)
+        collector = EventCollector()
+        info = _make_info("create")
+
+        runner.start_create(info, collector.emit)
+
+        self.assertTrue(collector.wait_for("peer_updated"))
+        data = collector.data_for("peer_updated")[0]
+        self.assertEqual(data["peer_ip"], "198.51.100.44")
+        self.assertEqual(data["peer_port"], 42001)
+        self.assertNotIn("relay_token", data)
+        self.assertTrue(runner.wait(timeout=1.0))
+
     def test_participant_and_room_lifecycle_events_map_to_backend_names(self):
         fake_core = make_fake_core_class(
             events=[

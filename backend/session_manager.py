@@ -18,6 +18,7 @@ from backend.models import (
     ADAPTER_STATUS_ERROR,
     ADAPTER_STATUS_READY,
     ADAPTER_TYPE_BUNDLE,
+    ADAPTER_TYPE_LOCAL_UDP_BRIDGE,
     ADAPTER_TYPE_TCP_FORWARD,
     AdapterConfig,
     AdapterStatus,
@@ -208,8 +209,8 @@ class SessionManager:
         adapter_config, secondary_ip_state = self._resolve_secondary_ip_adapter_config(
             adapter_config,
         )
-        _validate_forward_adapter_target(adapter_config)
         _validate_create_adapter_target(adapter_config, game_server_port)
+        _validate_forward_adapter_target(adapter_config)
 
         session_id = _generate_session_id()
         now = time.time()
@@ -281,10 +282,19 @@ class SessionManager:
         game_server_port = _optional_request_port(request, "game_server_port")
         force_relay = _request_bool(request, "force_relay", default=True)
         adapter_config = _parse_adapter_config(request)
+        if adapter_config is None:
+            adapter_config = AdapterConfig(
+                enabled=True,
+                adapter_type=ADAPTER_TYPE_BUNDLE,
+                bind_host="127.0.0.1",
+                bind_port=0,
+                target_host="127.0.0.1",
+                target_port=0,
+            )
         adapter_config, secondary_ip_state = self._resolve_secondary_ip_adapter_config(
             adapter_config,
         )
-        _validate_forward_adapter_target(adapter_config)
+        _validate_forward_adapter_target(adapter_config, for_join=True)
 
         session_id = _generate_session_id()
         now = time.time()
@@ -817,6 +827,38 @@ class SessionManager:
             if isinstance(data.get("relay_target_port"), int):
                 info.relay_target_port = data["relay_target_port"]
 
+        peer_endpoint = data.get("peer_endpoint")
+        if isinstance(peer_endpoint, dict):
+            self._apply_peer_endpoint(info, peer_endpoint, source="peer_endpoint")
+        elif "peer_ip" in data or "peer_port" in data:
+            self._apply_peer_endpoint(
+                info,
+                {
+                    "host": data.get("peer_ip"),
+                    "port": data.get("peer_port"),
+                },
+                source="peer_info",
+            )
+
+    @staticmethod
+    def _apply_peer_endpoint(
+        info: SessionInfo,
+        endpoint: Dict[str, Any],
+        *,
+        source: str,
+    ) -> None:
+        host = endpoint.get("host")
+        if not isinstance(host, str):
+            host = endpoint.get("ip")
+        port = endpoint.get("port")
+        if isinstance(host, str) and host.strip() and isinstance(port, int) and port > 0:
+            info.peer_endpoint_host = host.strip()
+            info.peer_endpoint_port = port
+            endpoint_source = endpoint.get("source")
+            info.peer_endpoint_source = (
+                endpoint_source if isinstance(endpoint_source, str) else source
+            )
+
     @staticmethod
     def _make_fake_bundle_transport(
         session_id: str,
@@ -933,6 +975,12 @@ def _validate_create_adapter_target(
 ) -> None:
     if adapter_config is None or not adapter_config.enabled:
         return
+    if adapter_config.target_port == 0:
+        raise BackendError(
+            code="INVALID_REQUEST",
+            message="Create adapter_config.target_port must be a valid game port",
+            details={"field": "adapter_config.target_port", "target_port": 0},
+        )
     if game_server_port is None:
         return
     if adapter_config.target_port != game_server_port:
@@ -949,17 +997,39 @@ def _validate_create_adapter_target(
 
 def _validate_forward_adapter_target(
     adapter_config: Optional[AdapterConfig],
+    for_join: bool = False,
 ) -> None:
+    if adapter_config is None or not adapter_config.enabled:
+        return
     if (
-        adapter_config is None
-        or not adapter_config.enabled
-        or adapter_config.adapter_type not in {
-            ADAPTER_TYPE_BUNDLE,
-            ADAPTER_TYPE_TCP_FORWARD,
-        }
+        for_join
+        and adapter_config.adapter_type == ADAPTER_TYPE_LOCAL_UDP_BRIDGE
+        and (adapter_config.target_port is None or adapter_config.target_port == 0)
+    ):
+        raise BackendError(
+            code="INVALID_REQUEST",
+            message=(
+                "UDP Only Join requires adapter_config.target_port; "
+                "no-target Join is only supported by Bundle mode"
+            ),
+            details={
+                "field": "adapter_config.target_port",
+                "adapter_type": ADAPTER_TYPE_LOCAL_UDP_BRIDGE,
+                "target_port": adapter_config.target_port,
+            },
+        )
+    if adapter_config.adapter_type not in {
+        ADAPTER_TYPE_BUNDLE,
+        ADAPTER_TYPE_TCP_FORWARD,
+    }:
+        return
+    if (
+        for_join
+        and adapter_config.adapter_type == ADAPTER_TYPE_BUNDLE
+        and adapter_config.target_port == 0
     ):
         return
-    if adapter_config.target_port is None:
+    if adapter_config.target_port is None or adapter_config.target_port == 0:
         mode_name = (
             "Bundle"
             if adapter_config.adapter_type == ADAPTER_TYPE_BUNDLE

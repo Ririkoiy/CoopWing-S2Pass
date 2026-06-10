@@ -34,10 +34,14 @@ ADAPTER_STATUSES = {
 BUNDLE_RULE_TCP_FORWARD = "tcp_forward"
 BUNDLE_RULE_UDP_FORWARD = "udp_forward"
 BUNDLE_RULE_UDP_BROADCAST_FORWARD = "udp_broadcast_forward"
+BUNDLE_RULE_TCP_RELAY = "tcp_relay"
+BUNDLE_RULE_UDP_RAW_BRIDGE = "udp_raw_bridge"
 BUNDLE_RULE_KINDS = {
     BUNDLE_RULE_TCP_FORWARD,
     BUNDLE_RULE_UDP_FORWARD,
     BUNDLE_RULE_UDP_BROADCAST_FORWARD,
+    BUNDLE_RULE_TCP_RELAY,
+    BUNDLE_RULE_UDP_RAW_BRIDGE,
 }
 BUNDLE_STATUS_RUNNING = "running"
 BUNDLE_STATUS_STOPPED = "stopped"
@@ -470,6 +474,9 @@ class SessionInfo:
     relay_token_available: bool = False
     relay_target_host: Optional[str] = None
     relay_target_port: Optional[int] = None
+    peer_endpoint_host: Optional[str] = None
+    peer_endpoint_port: Optional[int] = None
+    peer_endpoint_source: Optional[str] = None
     server_time: Optional[float] = None
     secondary_ip_enabled: bool = False
     secondary_ip_fallback_used: bool = False
@@ -509,6 +516,9 @@ class SessionInfo:
             "relay_token_available": self.relay_token_available,
             "relay_target_host": self.relay_target_host,
             "relay_target_port": self.relay_target_port,
+            "peer_endpoint_host": self.peer_endpoint_host,
+            "peer_endpoint_port": self.peer_endpoint_port,
+            "peer_endpoint_source": self.peer_endpoint_source,
             "server_time": self.server_time,
             "secondary_ip_enabled": self.secondary_ip_enabled,
             "secondary_ip_fallback_used": self.secondary_ip_fallback_used,
@@ -593,10 +603,10 @@ def _optional_adapter_port(raw: Dict[str, Any], key: str) -> Optional[int]:
             message=f"Field adapter_config.{key} must be an integer",
             details={"field": f"adapter_config.{key}", "value": str(value)},
         )
-    if value < 1 or value > 65535:
+    if value < 0 or value > 65535:
         raise BackendError(
             code="INVALID_REQUEST",
-            message=f"Field adapter_config.{key} must be in range 1-65535, got {value}",
+            message=f"Field adapter_config.{key} must be in range 0-65535, got {value}",
             details={"field": f"adapter_config.{key}", "value": value},
         )
     return value

@@ -12,6 +12,7 @@ from typing import Callable, Dict, Optional
 from adapters.base import AdapterBase
 from adapters.local_udp_bridge_adapter import LocalUdpBridgeAdapter
 from adapters.profile import GameProfile
+from adapters.bundle_transport_router import BundleTransportRouter
 from adapters.tcp_adapter import GenericTcpForwardAdapter
 from adapters.tcp_relay_adapter import TcpRelayAdapter
 from adapters.transport import Transport
@@ -28,8 +29,10 @@ from backend.models import (
     ADAPTER_TYPE_TCP_FORWARD,
     ADAPTER_TYPE_TCP_RELAY,
     BUNDLE_RULE_TCP_FORWARD,
+    BUNDLE_RULE_TCP_RELAY,
     BUNDLE_RULE_UDP_BROADCAST_FORWARD,
     BUNDLE_RULE_UDP_FORWARD,
+    BUNDLE_RULE_UDP_RAW_BRIDGE,
     AdapterConfig,
     AdapterCounters,
     AdapterStatus,
@@ -344,13 +347,19 @@ class AdapterManager:
         session_id: str,
         config: AdapterConfig,
     ) -> AdapterStatus:
-        if config.target_port is None:
+        if (
+            config.target_port is None
+            or config.target_port < 0
+            or config.target_port > 65535
+        ):
             return self._set_error(
                 session_id,
                 config,
                 "BUNDLE_START_FAILED",
-                "Bundle target_port is required",
+                "Bundle target_port is required (1-65535)",
             )
+
+        join_no_target = config.target_port == 0
 
         try:
             bind_port = (
@@ -362,7 +371,11 @@ class AdapterManager:
                 config.bind_host,
                 excluded_port=bind_port,
             )
-            transport = self._bundle_transport(session_id, config)
+            raw_transport = self._bundle_transport(session_id, config)
+            # Wrap in BundleTransportRouter so transport-backed bundle
+            # adapters each get their own RoutedTransport and do not
+            # overwrite each other's receive callbacks.
+            router = BundleTransportRouter(raw_transport)
             bundle = self._bundle_from_config(
                 session_id,
                 config,
@@ -372,7 +385,11 @@ class AdapterManager:
             runner = (
                 self._bundle_runner_factory()
                 if self._bundle_runner_factory is not None
-                else BundleRunner(transport_factory=lambda rule: transport)
+                else BundleRunner(
+                    transport_factory=lambda rule, _r=router: (
+                        _r.get_transport(rule.kind)
+                    ),
+                )
             )
             result = runner.start(bundle)
         except Exception as exc:
@@ -437,26 +454,108 @@ class AdapterManager:
             "remote_target_host": config.target_host,
             "remote_target_port": config.target_port,
         }
+        join_no_target = config.target_port == 0
+        if join_no_target:
+            tcp_relay_config = {
+                "local_bind_host": config.bind_host,
+                "local_bind_port": bind_port,
+            }
+            udp_raw_config = {
+                "local_bind_host": config.bind_host,
+                "local_bind_port": bind_port,
+            }
+            broadcast_config = {
+                "local_bind_host": config.bind_host,
+                "local_bind_port": broadcast_bind_port,
+                "remote_target_host": "127.0.0.1",
+                "remote_target_port": broadcast_bind_port,
+                "route_responses_to_last_sender": True,
+                "strict_target_port_match": False,
+            }
+            return BundleConfig(
+                id=f"{session_id}_bundle",
+                rules=[
+                    BundleRule(
+                        id=f"{session_id}_tcp",
+                        kind=BUNDLE_RULE_TCP_FORWARD,
+                        enabled=False,
+                        config=dict(rule_config),
+                    ),
+                    BundleRule(
+                        id=f"{session_id}_udp",
+                        kind=BUNDLE_RULE_UDP_FORWARD,
+                        enabled=False,
+                        config=dict(rule_config),
+                    ),
+                    BundleRule(
+                        id=f"{session_id}_tcp_relay",
+                        kind=BUNDLE_RULE_TCP_RELAY,
+                        enabled=True,
+                        config=tcp_relay_config,
+                    ),
+                    BundleRule(
+                        id=f"{session_id}_udp_raw",
+                        kind=BUNDLE_RULE_UDP_RAW_BRIDGE,
+                        enabled=True,
+                        config=udp_raw_config,
+                    ),
+                    BundleRule(
+                        id=f"{session_id}_udp_broadcast",
+                        kind=BUNDLE_RULE_UDP_BROADCAST_FORWARD,
+                        config=broadcast_config,
+                    ),
+                ],
+            )
+        tcp_relay_config = {
+            "local_bind_host": config.bind_host,
+            "local_bind_port": 0,
+            "remote_target_host": config.target_host,
+            "remote_target_port": config.target_port,
+        }
+        udp_raw_config = {
+            "local_bind_host": config.bind_host,
+            "local_bind_port": 0,
+            "remote_target_host": config.target_host,
+            "remote_target_port": config.target_port,
+        }
+        broadcast_config = {
+            "local_bind_host": config.bind_host,
+            "local_bind_port": broadcast_bind_port,
+            "remote_target_host": config.target_host,
+            "remote_target_port": config.target_port,
+            "strict_target_port_match": False,
+        }
         return BundleConfig(
             id=f"{session_id}_bundle",
             rules=[
                 BundleRule(
                     id=f"{session_id}_tcp",
                     kind=BUNDLE_RULE_TCP_FORWARD,
+                    enabled=True,
                     config=dict(rule_config),
                 ),
                 BundleRule(
                     id=f"{session_id}_udp",
                     kind=BUNDLE_RULE_UDP_FORWARD,
+                    enabled=True,
                     config=dict(rule_config),
+                ),
+                BundleRule(
+                    id=f"{session_id}_tcp_relay",
+                    kind=BUNDLE_RULE_TCP_RELAY,
+                    enabled=True,
+                    config=tcp_relay_config,
+                ),
+                BundleRule(
+                    id=f"{session_id}_udp_raw",
+                    kind=BUNDLE_RULE_UDP_RAW_BRIDGE,
+                    enabled=True,
+                    config=udp_raw_config,
                 ),
                 BundleRule(
                     id=f"{session_id}_udp_broadcast",
                     kind=BUNDLE_RULE_UDP_BROADCAST_FORWARD,
-                    config={
-                        **rule_config,
-                        "local_bind_port": broadcast_bind_port,
-                    },
+                    config=broadcast_config,
                 ),
             ],
         )
@@ -491,16 +590,75 @@ class AdapterManager:
         bundle: BundleConfig,
         broadcast_bind_port: int,
     ) -> Dict[str, object]:
-        return {
+        has_game_forward = any(
+            rule.enabled and rule.kind in {
+                BUNDLE_RULE_TCP_FORWARD,
+                BUNDLE_RULE_UDP_FORWARD,
+            }
+            for rule in bundle.rules
+        )
+        has_broadcast = any(
+            rule.enabled and rule.kind == BUNDLE_RULE_UDP_BROADCAST_FORWARD
+            for rule in bundle.rules
+        )
+        has_tcp_relay = any(
+            rule.enabled and rule.kind == BUNDLE_RULE_TCP_RELAY
+            for rule in bundle.rules
+        )
+        has_udp_raw_bridge = any(
+            rule.enabled and rule.kind == BUNDLE_RULE_UDP_RAW_BRIDGE
+            for rule in bundle.rules
+        )
+        diag: Dict[str, object] = {
             **result,
             "included_rule_kinds": [rule.kind for rule in bundle.rules],
-            "local_game_connection": {
-                "host": bundle.rules[0].config.get("local_bind_host"),
-                "port": bundle.rules[0].config.get("local_bind_port"),
-            },
             "udp_broadcast_bind_port": broadcast_bind_port,
-            "udp_broadcast_lan_discovery_included": True,
+            "discovery_helper_connection": {
+                "host": bundle.rules[0].config.get("local_bind_host"),
+                "port": broadcast_bind_port,
+                "udp_available": has_broadcast,
+            },
+            "udp_broadcast_lan_discovery_included": has_broadcast,
+            "broadcast_only_forwarding": (
+                not has_game_forward
+                and not has_tcp_relay
+                and not has_udp_raw_bridge
+                and has_broadcast
+            ),
+            "tcp_relay_available": has_tcp_relay,
+            "udp_raw_bridge_available": has_udp_raw_bridge,
+            "tcp_available": has_game_forward or has_tcp_relay,
+            "udp_available": has_game_forward or has_udp_raw_bridge,
         }
+        # Determine bind_port for local_game_connection
+        bind_host = bundle.rules[0].config.get("local_bind_host")
+        if has_game_forward:
+            # Create/host: local_game_connection is the shared TCP/UDP
+            # port used by tcp_forward and udp_forward.
+            bind_port = bundle.rules[0].config.get("local_bind_port")
+            diag["local_game_connection"] = {
+                "host": bind_host,
+                "port": bind_port,
+                "tcp_available": True,
+                "udp_available": True,
+            }
+        elif has_tcp_relay or has_udp_raw_bridge:
+            shared_port = None
+            for rule in bundle.rules:
+                if rule.enabled and rule.kind in {
+                    BUNDLE_RULE_TCP_RELAY,
+                    BUNDLE_RULE_UDP_RAW_BRIDGE,
+                }:
+                    shared_port = rule.config.get("local_bind_port")
+                    if shared_port:
+                        break
+            diag["local_game_connection"] = {
+                "host": bind_host,
+                "port": shared_port,
+                "tcp_available": has_tcp_relay,
+                "udp_available": has_udp_raw_bridge,
+            }
+        return diag
 
     def _profile_from_config(self, session_id: str, config: AdapterConfig) -> GameProfile:
         if config.adapter_type == ADAPTER_TYPE_TCP_FORWARD:
@@ -540,29 +698,24 @@ def _bundle_counters(rule_statuses: list[dict[str, object]]) -> AdapterCounters:
         if not isinstance(stats, dict):
             continue
         kind = rule.get("kind")
-        if kind == BUNDLE_RULE_TCP_FORWARD:
-            bytes_to_target = _int_stat(stats, "bytes_forwarded_to_target")
-            bytes_to_client = _int_stat(stats, "bytes_forwarded_to_client")
-            counters.bytes_from_game += bytes_to_target
-            counters.bytes_to_game += bytes_to_client
-            if bytes_to_target:
-                counters.packets_from_game += _int_stat(stats, "total_connections")
-            if bytes_to_client:
-                counters.packets_to_game += _int_stat(stats, "total_connections")
-        elif kind == BUNDLE_RULE_UDP_FORWARD:
-            counters.packets_from_game += _int_stat(stats, "received_packets")
-            counters.packets_to_transport += _int_stat(stats, "sent_packets")
-            counters.bytes_from_game += _int_stat(stats, "received_bytes")
-            counters.bytes_to_transport += _int_stat(stats, "sent_bytes")
-        elif kind == BUNDLE_RULE_UDP_BROADCAST_FORWARD:
-            counters.packets_from_game += _int_stat(stats, "packets_from_local")
+        if kind == BUNDLE_RULE_TCP_RELAY:
+            counters.packets_from_game += _int_stat(stats, "packets_from_game")
             counters.packets_to_transport += _int_stat(stats, "packets_to_transport")
             counters.packets_from_transport += _int_stat(stats, "packets_from_transport")
-            counters.packets_to_game += _int_stat(stats, "packets_to_local")
-            counters.bytes_from_game += _int_stat(stats, "bytes_from_local")
+            counters.packets_to_game += _int_stat(stats, "packets_to_game")
+            counters.bytes_from_game += _int_stat(stats, "bytes_from_game")
             counters.bytes_to_transport += _int_stat(stats, "bytes_to_transport")
             counters.bytes_from_transport += _int_stat(stats, "bytes_from_transport")
-            counters.bytes_to_game += _int_stat(stats, "bytes_to_local")
+            counters.bytes_to_game += _int_stat(stats, "bytes_to_game")
+        elif kind == BUNDLE_RULE_UDP_RAW_BRIDGE:
+            counters.packets_from_game += _int_stat(stats, "packets_from_game")
+            counters.packets_to_transport += _int_stat(stats, "packets_to_transport")
+            counters.packets_from_transport += _int_stat(stats, "packets_from_transport")
+            counters.packets_to_game += _int_stat(stats, "packets_to_game")
+            counters.bytes_from_game += _int_stat(stats, "bytes_from_game")
+            counters.bytes_to_transport += _int_stat(stats, "bytes_to_transport")
+            counters.bytes_from_transport += _int_stat(stats, "bytes_from_transport")
+            counters.bytes_to_game += _int_stat(stats, "bytes_to_game")
     return counters
 
 

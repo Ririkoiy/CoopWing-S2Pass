@@ -75,6 +75,13 @@ run_gui.ps1
 gui_client.py
 gui_adapter_controller.py
 
+# Local package scripts (not for commit)
+package.ps1
+package_v04_windows.ps1
+
+# Build temporary directory
+buildpyinstaller_backend/
+
 # Packaging specs
 coopwing_backend.spec
 

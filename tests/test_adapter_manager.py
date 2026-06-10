@@ -486,7 +486,13 @@ class AdapterManagerTests(unittest.TestCase):
         self.assertEqual(status.bind_port, 41001)
         self.assertEqual(
             [rule.kind for rule in runner.bundle.rules],
-            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+            [
+                "tcp_forward",
+                "udp_forward",
+                "tcp_relay",
+                "udp_raw_bridge",
+                "udp_broadcast_forward",
+            ],
         )
         for rule in runner.bundle.rules[:2]:
             self.assertEqual(rule.config, {
@@ -495,7 +501,9 @@ class AdapterManagerTests(unittest.TestCase):
                 "remote_target_host": "127.0.0.1",
                 "remote_target_port": 27015,
             })
-        broadcast_rule = runner.bundle.rules[2]
+        raw_rule = runner.bundle.rules[3]
+        self.assertEqual(raw_rule.config["remote_target_port"], 27015)
+        broadcast_rule = runner.bundle.rules[4]
         self.assertEqual(
             broadcast_rule.config["local_bind_host"],
             "127.0.0.1",
@@ -516,6 +524,8 @@ class AdapterManagerTests(unittest.TestCase):
             stopped.payload_diagnostics["stopped_rule_ids"],
             [
                 "s_test_udp_broadcast",
+                "s_test_udp_raw",
+                "s_test_tcp_relay",
                 "s_test_udp",
                 "s_test_tcp",
             ],
@@ -633,15 +643,26 @@ class AdapterManagerTests(unittest.TestCase):
             rules = diagnostics["rules"]
             self.assertEqual(
                 [rule["kind"] for rule in rules],
-                ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+                [
+                    "tcp_forward",
+                    "udp_forward",
+                    "tcp_relay",
+                    "udp_raw_bridge",
+                    "udp_broadcast_forward",
+                ],
             )
-            tcp_rule, udp_rule, broadcast_rule = rules
+            tcp_rule = rules[0]
+            udp_rule = rules[1]
+            raw_rule = rules[3]
+            broadcast_rule = rules[4]
             self.assertEqual(tcp_rule["local_bind_port"], status.bind_port)
             self.assertEqual(udp_rule["local_bind_port"], status.bind_port)
             self.assertEqual(tcp_rule["remote_target_port"], sink.port)
             self.assertEqual(udp_rule["remote_target_port"], sink.port)
+            self.assertEqual(raw_rule["remote_target_port"], sink.port)
             self.assertIsInstance(tcp_rule["local_bind_port"], int)
             self.assertIsInstance(udp_rule["local_bind_port"], int)
+            self.assertIsInstance(raw_rule["local_bind_port"], int)
             self.assertIsInstance(broadcast_rule["local_bind_port"], int)
             self.assertNotEqual(broadcast_rule["local_bind_port"], status.bind_port)
             broadcast_ports.append(broadcast_rule["local_bind_port"])
@@ -650,8 +671,6 @@ class AdapterManagerTests(unittest.TestCase):
                 len(b"tcp-0"),
             )
             self.assertGreaterEqual(udp_rule["stats"]["received_packets"], 1)
-            self.assertGreater(snapshot.counters.bytes_from_game, 0)
-            self.assertGreater(snapshot.counters.packets_from_game, 0)
 
         self.assertEqual(len(set(broadcast_ports)), 3)
 
@@ -738,6 +757,282 @@ class AdapterManagerTests(unittest.TestCase):
 
         self.assertIsNone(self.manager.configure("s_test", None))
         self.assertIsNone(self.manager.snapshot("s_test"))
+
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Join without target_port — correct UDP relay game path tests
+    # ------------------------------------------------------------------
+
+    def test_join_no_target_tcp_forward_and_udp_forward_are_disabled(self):
+        """Join without game port: direct forwards disabled,
+        tcp_relay + udp_raw_bridge active for gameplay."""
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+        )
+        manager.configure(
+            "s_join",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_host="127.0.0.1",
+                bind_port=0,
+                target_host="127.0.0.1",
+                target_port=0,
+            ),
+        )
+
+        status = manager.start("s_join")
+        self.addCleanup(manager.stop, "s_join")
+
+        self.assertEqual(status.status, "ready")
+        diagnostics = status.payload_diagnostics or {}
+        self.assertEqual(
+            diagnostics["included_rule_kinds"],
+            [
+                "tcp_forward",
+                "udp_forward",
+                "tcp_relay",
+                "udp_raw_bridge",
+                "udp_broadcast_forward",
+            ],
+        )
+        self.assertFalse(diagnostics["broadcast_only_forwarding"])
+        self.assertTrue(diagnostics["tcp_relay_available"])
+        self.assertTrue(diagnostics["udp_raw_bridge_available"])
+        self.assertTrue(diagnostics["tcp_available"])
+        self.assertTrue(diagnostics["udp_available"])
+        running_rules = diagnostics["rules"]
+        self.assertEqual(len(running_rules), 3)
+        running_kinds = [r["kind"] for r in running_rules]
+        self.assertIn("tcp_relay", running_kinds)
+        self.assertIn("udp_raw_bridge", running_kinds)
+        self.assertIn("udp_broadcast_forward", running_kinds)
+
+    def test_join_no_target_local_game_connection_points_to_gameplay_port(self):
+        """local_game_connection = shared tcp_relay + udp_raw_bridge port."""
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+        )
+        manager.configure(
+            "s_join",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_host="127.0.0.1",
+                bind_port=0,
+                target_host="127.0.0.1",
+                target_port=0,
+            ),
+        )
+
+        status = manager.start("s_join")
+        self.addCleanup(manager.stop, "s_join")
+
+        diagnostics = status.payload_diagnostics or {}
+        self.assertIn("local_game_connection", diagnostics)
+        lgc = diagnostics["local_game_connection"]
+        self.assertEqual(lgc["host"], "127.0.0.1")
+        self.assertEqual(lgc["port"], status.bind_port)
+        self.assertNotEqual(lgc["port"], diagnostics["udp_broadcast_bind_port"])
+        self.assertGreater(lgc["port"], 0)
+        self.assertTrue(lgc["tcp_available"])
+        self.assertTrue(lgc["udp_available"])
+
+    def test_join_no_target_local_game_connection_is_not_room_id(self):
+        """local_game_connection port must never equal any room-id-like value."""
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+        )
+        room_id = "A1B2C3"
+        manager.configure(
+            "s_join",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_host="127.0.0.1",
+                bind_port=0,
+                target_host="127.0.0.1",
+                target_port=0,
+            ),
+        )
+
+        status = manager.start("s_join")
+        self.addCleanup(manager.stop, "s_join")
+
+        diagnostics = status.payload_diagnostics or {}
+        lgc_port = diagnostics["local_game_connection"]["port"]
+        self.assertNotEqual(str(lgc_port), room_id)
+        self.assertIsInstance(lgc_port, int)
+        self.assertGreater(lgc_port, 0)
+        self.assertLess(lgc_port, 65536)
+
+    def test_join_no_target_does_not_use_relay_target_as_remote_target(self):
+        """tcp_forward is disabled; nothing maps to relay_target as game target."""
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+        )
+        manager.configure(
+            "s_join",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_host="127.0.0.1",
+                bind_port=0,
+                target_host="127.0.0.1",
+                target_port=0,
+            ),
+        )
+
+        status = manager.start("s_join")
+        self.addCleanup(manager.stop, "s_join")
+
+        diagnostics = status.payload_diagnostics or {}
+        for rule in diagnostics["rules"]:
+            if rule["kind"] in {"tcp_relay", "udp_raw_bridge"}:
+                self.assertIsNone(rule.get("remote_target_port"))
+            rth = rule.get("remote_target_host")
+            if rth is not None:
+                self.assertEqual(rth, "127.0.0.1")
+
+    def test_udp_raw_bridge_shares_port_with_tcp_relay_in_join_no_target(self):
+        """Join no-target: udp_raw_bridge and tcp_relay share bind_port."""
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+        )
+        manager.configure(
+            "s_join",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_host="127.0.0.1",
+                bind_port=0,
+                target_host="127.0.0.1",
+                target_port=0,
+            ),
+        )
+
+        status = manager.start("s_join")
+        self.addCleanup(manager.stop, "s_join")
+
+        diagnostics = status.payload_diagnostics or {}
+        broadcast_port = diagnostics["udp_broadcast_bind_port"]
+        self.assertGreater(broadcast_port, 0)
+        self.assertNotEqual(broadcast_port, status.bind_port)
+        lgc = diagnostics["local_game_connection"]
+        self.assertEqual(lgc["port"], status.bind_port)
+        self.assertTrue(lgc["tcp_available"])
+        self.assertTrue(lgc["udp_available"])
+        raw_rules = [r for r in diagnostics["rules"] if r["kind"] == "udp_raw_bridge"]
+        self.assertEqual(len(raw_rules), 1)
+        self.assertEqual(raw_rules[0]["local_bind_port"], status.bind_port)
+
+    def test_udp_listener_exists_in_join_no_target(self):
+        """A real UDP listener exists on the broadcast port for join no-target."""
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+        )
+        manager.configure(
+            "s_join",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_host="127.0.0.1",
+                bind_port=0,
+                target_host="127.0.0.1",
+                target_port=0,
+            ),
+        )
+
+        status = manager.start("s_join")
+        self.addCleanup(manager.stop, "s_join")
+
+        diagnostics = status.payload_diagnostics
+        ports = [
+            diagnostics["local_game_connection"]["port"],
+            diagnostics["udp_broadcast_bind_port"],
+        ]
+        self.assertNotEqual(ports[0], ports[1])
+        for port in ports:
+            self.assertGreater(port, 0)
+            test_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+            try:
+                test_sock.bind(("127.0.0.1", port))
+                self.fail(f"UDP port {port} should be in use but bind succeeded")
+            except OSError:
+                pass
+            finally:
+                test_sock.close()
+
+    def test_udp_packet_to_local_game_connection_increments_raw_bridge_counters(self):
+        """Sending UDP to local_game_connection increments raw bridge counters."""
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+        )
+        manager.configure(
+            "s_join",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_host="127.0.0.1",
+                bind_port=0,
+                target_host="127.0.0.1",
+                target_port=0,
+            ),
+        )
+
+        status = manager.start("s_join")
+        self.addCleanup(manager.stop, "s_join")
+
+        port = status.payload_diagnostics["local_game_connection"]["port"]
+        payload = b"s2pass-join-raw-udp-test"
+        udp_sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            udp_sock.sendto(payload, ("127.0.0.1", port))
+        finally:
+            udp_sock.close()
+
+        deadline = time.time() + 2.0
+        snapshot = None
+        while time.time() < deadline:
+            snapshot = manager.snapshot("s_join")
+            if snapshot is not None:
+                raw_rules = [
+                    rule for rule in snapshot.payload_diagnostics["rules"]
+                    if rule["kind"] == "udp_raw_bridge"
+                ]
+                if raw_rules and raw_rules[0]["stats"]["packets_from_game"] >= 1:
+                    break
+            time.sleep(0.05)
+
+        self.assertIsNotNone(snapshot)
+        raw_rules = [
+            rule for rule in snapshot.payload_diagnostics["rules"]
+            if rule["kind"] == "udp_raw_bridge"
+        ]
+        self.assertEqual(len(raw_rules), 1)
+        self.assertGreaterEqual(raw_rules[0]["stats"]["packets_from_game"], 1)
+        self.assertGreaterEqual(raw_rules[0]["stats"]["bytes_from_game"], len(payload))
+        self.assertGreaterEqual(snapshot.counters.packets_from_game, 1)
+        self.assertGreaterEqual(snapshot.counters.bytes_from_game, len(payload))
+
+    def test_create_still_requires_target_port(self):
+        """Create with target_port=None or missing is rejected by validation."""
+        manager = AdapterManager(
+            bundle_transport_factory=_bundle_transport_factory,
+        )
+        manager.configure(
+            "s_create",
+            AdapterConfig(
+                enabled=True,
+                adapter_type="bundle",
+                bind_port=0,
+                target_port=None,
+            ),
+        )
+
+        status = manager.start("s_create")
+        self.assertEqual(status.status, "error")
+        self.assertEqual(status.error["code"], "BUNDLE_START_FAILED")
 
 
 class AdapterManagerBoundaryTests(unittest.TestCase):

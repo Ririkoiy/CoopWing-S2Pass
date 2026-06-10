@@ -5,10 +5,12 @@ from adapters.udp_adapter import GenericUdpForwardAdapter
 from adapters.tcp_adapter import GenericTcpForwardAdapter
 from adapters.tcp_relay_adapter import TcpRelayAdapter
 from adapters.udp_broadcast_forward_adapter import GenericUdpBroadcastForwardAdapter
+from adapters.udp_raw_bridge_adapter import UdpRawBridgeAdapter
 from adapters.factory import create_adapter
 from adapters.transport import Transport, FakePairTransport, make_fake_pair
 from adapters.local_udp_bridge_adapter import LocalUdpBridgeAdapter
 from adapters.core_transport_adapter import CoreTransportAdapter
+from adapters.bundle_transport_router import BundleTransportRouter, RoutedTransport
 
 __all__ = [
     "GameProfile",
@@ -18,12 +20,15 @@ __all__ = [
     "GenericTcpForwardAdapter",
     "TcpRelayAdapter",
     "GenericUdpBroadcastForwardAdapter",
+    "UdpRawBridgeAdapter",
     "create_adapter",
     "Transport",
     "FakePairTransport",
     "make_fake_pair",
     "LocalUdpBridgeAdapter",
     "CoreTransportAdapter",
+    "BundleTransportRouter",
+    "RoutedTransport",
     "load_profiles",
     "save_profiles",
 ]

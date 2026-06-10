@@ -852,11 +852,17 @@ class TestCreateSessionEndpoint(HTTPTestBase):
         self.assertGreater(data["adapter_status"]["bind_port"], 0)
         self.assertEqual(
             len(data["adapter_status"]["payload_diagnostics"]["started_rule_ids"]),
-            3,
+            5,
         )
         self.assertEqual(
             data["adapter_status"]["payload_diagnostics"]["included_rule_kinds"],
-            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+            [
+                "tcp_forward",
+                "udp_forward",
+                "tcp_relay",
+                "udp_raw_bridge",
+                "udp_broadcast_forward",
+            ],
         )
         self.assertNotEqual(
             data["adapter_status"]["payload_diagnostics"][
@@ -890,6 +896,23 @@ class TestCreateSessionEndpoint(HTTPTestBase):
             data["error"]["details"]["field"],
             "adapter_config.target_port",
         )
+
+    def test_create_bundle_target_port_zero_returns_400(self):
+        status, data = self.req("POST", "/sessions/create", {
+            "server_host": "192.168.1.10",
+            "player_name": "CreatorA",
+            "adapter_config": {
+                "enabled": True,
+                "adapter_type": "bundle",
+                "bind_port": 0,
+                "target_port": 0,
+            },
+        })
+
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
+        self.assertEqual(data["error"]["details"]["field"], "adapter_config.target_port")
+        self.assertEqual(data["error"]["details"]["target_port"], 0)
 
     def test_create_with_invalid_adapter_config_returns_400(self):
         status, data = self.req("POST", "/sessions/create", {
@@ -988,16 +1011,16 @@ class TestJoinSessionEndpoint(HTTPTestBase):
         self.assertEqual(status, 400)
         self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
 
-    def test_join_without_adapter_config_omits_adapter_status(self):
+    def test_join_without_adapter_config_auto_derives_bundle_status(self):
         status, data = self.req("POST", "/sessions/join", {
             "server_host": "192.168.1.10",
             "room_id": "ABC234",
             "player_name": "JoinerB",
         })
         self.assertEqual(status, 201)
-        self.assertNotIn("adapter_status", data)
+        self.assertIn("adapter_status", data)
 
-    def test_join_with_valid_adapter_config_stays_passive_in_fake_mode(self):
+    def test_join_udp_only_without_target_port_returns_400(self):
         status, data = self.req("POST", "/sessions/join", {
             "server_host": "192.168.1.10",
             "room_id": "ABC234",
@@ -1008,14 +1031,19 @@ class TestJoinSessionEndpoint(HTTPTestBase):
                 "bind_port": 0,
             },
         })
-        self.assertEqual(status, 201)
-        self.assertEqual(data["status"], "running")
-        self.assertEqual(data["adapter_status"]["status"], "stopped")
-        self.assertNotIn("target_port", data["adapter_status"])
+
+        self.assertEqual(status, 400)
+        self.assertEqual(data["error"]["code"], "INVALID_REQUEST")
+        self.assertIn("UDP Only Join requires", data["error"]["message"])
+        self.assertNotIn("room", data["error"]["message"].lower())
+        self.assertEqual(data["error"]["details"]["field"], "adapter_config.target_port")
+        self.assertEqual(data["error"]["details"]["adapter_type"], "local_udp_bridge")
+        self.assertIsNone(data["error"]["details"]["target_port"])
+        self.assertFalse(_json_contains_key(data, "adapter_status"))
         self.assertFalse(_json_contains_key(data, "relay_token"))
 
     def test_join_bundle_without_game_server_port_starts_local_rules(self):
-        status, data = self.req("POST", "/sessions/join", {
+        request = {
             "server_host": "192.168.1.10",
             "room_id": "RN4Y78",
             "player_name": "JoinerB",
@@ -1025,35 +1053,58 @@ class TestJoinSessionEndpoint(HTTPTestBase):
                 "bind_host": "127.0.0.1",
                 "bind_port": 0,
                 "target_host": "127.0.0.1",
-                "target_port": 27015,
+                "target_port": 0,
             },
-        })
+        }
+        status, data = self.req("POST", "/sessions/join", request)
 
         self.assertEqual(status, 201)
         self.assertNotIn("game_server_port", data)
+        self.assertEqual(request["adapter_config"]["target_port"], 0)
         self.assertEqual(data["status"], "running")
         adapter_status = data["adapter_status"]
         diagnostics = adapter_status["payload_diagnostics"]
         self.assertEqual(adapter_status["status"], "ready")
         self.assertEqual(adapter_status["adapter_type"], "bundle")
-        self.assertEqual(adapter_status["target_port"], 27015)
+        self.assertEqual(adapter_status["target_port"], 0)
         self.assertGreater(adapter_status["bind_port"], 0)
         self.assertEqual(
             diagnostics["included_rule_kinds"],
-            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
+            [
+                "tcp_forward",
+                "udp_forward",
+                "tcp_relay",
+                "udp_raw_bridge",
+                "udp_broadcast_forward",
+            ],
         )
         self.assertEqual(
-            diagnostics["local_game_connection"],
-            {"host": "127.0.0.1", "port": adapter_status["bind_port"]},
+            diagnostics["local_game_connection"]["host"],
+            "127.0.0.1",
         )
         self.assertEqual(
-            [rule["kind"] for rule in diagnostics["rules"]],
-            ["tcp_forward", "udp_forward", "udp_broadcast_forward"],
-        )
-        self.assertNotEqual(
-            diagnostics["rules"][2]["local_bind_port"],
+            diagnostics["local_game_connection"]["port"],
             adapter_status["bind_port"],
         )
+        self.assertTrue(diagnostics["local_game_connection"]["tcp_available"])
+        self.assertTrue(diagnostics["local_game_connection"]["udp_available"])
+        self.assertEqual(
+            [rule["kind"] for rule in diagnostics["rules"]],
+            ["tcp_relay", "udp_raw_bridge", "udp_broadcast_forward"],
+        )
+        self.assertNotEqual(
+            diagnostics["udp_broadcast_bind_port"],
+            adapter_status["bind_port"],
+        )
+        self.assertEqual(
+            diagnostics["rules"][1]["local_bind_port"],
+            adapter_status["bind_port"],
+        )
+        self.assertEqual(
+            diagnostics["discovery_helper_connection"]["port"],
+            diagnostics["udp_broadcast_bind_port"],
+        )
+        self.assertFalse(diagnostics["broadcast_only_forwarding"])
         self.assertFalse(_json_contains_key(data, "relay_token"))
 
 
@@ -1167,6 +1218,14 @@ class TestStatusEndpoint(HTTPTestBase):
             "relay_target_host": "203.0.113.10",
             "relay_target_port": 9001,
         })
+        manager._emit_event(created["session_id"], "peer_updated", "Peer endpoint updated", {
+            "room_id": created["room_id"],
+            "peer_endpoint": {
+                "host": "198.51.100.44",
+                "port": 42001,
+                "source": "session_diagnostics",
+            },
+        })
 
         status, data = self.req("GET", f"/sessions/{created['session_id']}/status")
 
@@ -1181,6 +1240,10 @@ class TestStatusEndpoint(HTTPTestBase):
         self.assertTrue(data["relay_token_available"])
         self.assertEqual(data["relay_target_host"], "203.0.113.10")
         self.assertEqual(data["relay_target_port"], 9001)
+        self.assertEqual(data["peer_endpoint_host"], "198.51.100.44")
+        self.assertEqual(data["peer_endpoint_port"], 42001)
+        self.assertEqual(data["peer_endpoint_source"], "session_diagnostics")
+        self.assertNotEqual(data["peer_endpoint_host"], data["relay_target_host"])
         self.assertFalse(_json_contains_key(data, "relay_token"))
 
     def test_status_room_closed_after_room_closed_event(self):

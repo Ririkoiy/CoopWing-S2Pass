@@ -630,6 +630,23 @@ class TestV2RoomLifecycle(unittest.IsolatedAsyncioTestCase):
             [],
         )
 
+    async def test_v2_waiting_udp_reg_inactivity_does_not_remove_active_host(self) -> None:
+        """A lone v2 host UDP REG does not make a WAITING room look abandoned."""
+        room_id, alice_id, alice_writer = await self._create_v2_room(max_players=4)
+        alice_addr = ("198.51.100.50", 43000)
+
+        await self._register_udp(alice_id, room_id, alice_addr)
+
+        room = self.server._rooms[room_id]
+        self.assertEqual(room.state, srv.STATE_WAITING)
+        self.assertEqual(list(room.participants.keys()), [alice_id])
+        self.assertEqual(len(room.participants), 1)
+        self.assertIn(alice_id, self.server._players)
+        self.assertEqual(self.server._players[alice_id].udp_addr, alice_addr)
+        self.assertIn(alice_addr, self.server._udp_to_player)
+        self.assertEqual(_messages_of_type(alice_writer, srv.MSG_ROOM_UPDATED), [])
+        self.assertEqual(_messages_of_type(alice_writer, srv.MSG_RELAY_ENABLED), [])
+
 
 class TestV2RelayActivation(unittest.IsolatedAsyncioTestCase):
     """Implemented E3 UDP REG and RELAY_ENABLED activation behavior."""

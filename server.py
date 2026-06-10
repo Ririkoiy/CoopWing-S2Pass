@@ -1382,8 +1382,6 @@ class P2PServer:
             return
 
         await self._send_room_updated(room, "participant_left")
-        if remaining < 2:
-            await self._close_room(room.room_id, reason=reason)
 
     async def _handle_heartbeat(
         self,

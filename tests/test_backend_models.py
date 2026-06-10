@@ -7,6 +7,7 @@ import unittest
 from backend.models import (
     ADAPTER_STATUS_ERROR,
     ADAPTER_STATUS_READY,
+    BUNDLE_RULE_UDP_RAW_BRIDGE,
     AdapterConfig,
     AdapterCounters,
     AdapterStatus,
@@ -88,6 +89,15 @@ class AdapterConfigTests(unittest.TestCase):
         self.assertEqual(cfg.bind_port, 40100)
         self.assertEqual(cfg.target_port, 40200)
 
+    def test_from_dict_accepts_zero_target_port_sentinel(self):
+        cfg = AdapterConfig.from_dict({
+            "enabled": True,
+            "adapter_type": "bundle",
+            "target_port": 0,
+        })
+
+        self.assertEqual(cfg.target_port, 0)
+
     def test_enabled_request_without_explicit_type_defaults_to_bundle(self):
         cfg = AdapterConfig.from_dict({
             "enabled": True,
@@ -95,6 +105,25 @@ class AdapterConfigTests(unittest.TestCase):
         })
 
         self.assertEqual(cfg.adapter_type, "bundle")
+
+
+    def test_bundle_rule_udp_raw_bridge_round_trip(self):
+        from backend.models import BundleRule
+
+        rule = BundleRule.from_dict({
+            "id": "raw",
+            "kind": BUNDLE_RULE_UDP_RAW_BRIDGE,
+            "config": {"local_bind_port": 40123},
+        })
+
+        self.assertEqual(BUNDLE_RULE_UDP_RAW_BRIDGE, "udp_raw_bridge")
+        self.assertEqual(rule.kind, "udp_raw_bridge")
+        self.assertEqual(rule.to_dict(), {
+            "id": "raw",
+            "kind": "udp_raw_bridge",
+            "enabled": True,
+            "config": {"local_bind_port": 40123},
+        })
 
 
 class AdapterStatusTests(unittest.TestCase):

@@ -17,6 +17,7 @@ from network_core import S2PassClientCore, S2PassConfig
 _CORE_CREATED_EVT = getattr(_core_api, "EVT_" + "ROOM" + "_CREATED")
 _CORE_JOINED_EVT = getattr(_core_api, "EVT_" + "ROOM" + "_JOINED")
 _CORE_UPDATED_EVT = getattr(_core_api, "EVT_" + "ROOM" + "_UPDATED")
+_CORE_PEER_INFO_EVT = getattr(_core_api, "EVT_" + "PEER" + "_INFO")
 _CORE_PARTICIPANT_JOINED_EVT = getattr(_core_api, "EVT_" + "PARTICIPANT" + "_JOINED")
 _CORE_PARTICIPANT_LEFT_EVT = getattr(_core_api, "EVT_" + "PARTICIPANT" + "_LEFT")
 _CORE_ROOM_READY_EVT = getattr(_core_api, "EVT_" + "ROOM" + "_READY")
@@ -317,6 +318,8 @@ class CoreSessionRunner:
             emit("room_joined", message or "Room joined", room_data)
         elif event_type == _CORE_UPDATED_EVT:
             emit("room_updated", message or "Room updated", self._safe_room_data(data))
+        elif event_type == _CORE_PEER_INFO_EVT:
+            emit("peer_updated", message or "Peer endpoint updated", self._safe_room_data(data))
         elif event_type == _CORE_PARTICIPANT_JOINED_EVT:
             emit(
                 "participant_joined",

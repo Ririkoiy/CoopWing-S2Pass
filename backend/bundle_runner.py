@@ -9,14 +9,18 @@ from adapters.profile import GameProfile
 from adapters.tcp_adapter import GenericTcpForwardAdapter
 from adapters.transport import Transport
 from adapters.udp_adapter import GenericUdpForwardAdapter
+from adapters.tcp_relay_adapter import TcpRelayAdapter
 from adapters.udp_broadcast_forward_adapter import (
     GenericUdpBroadcastForwardAdapter,
 )
+from adapters.udp_raw_bridge_adapter import UdpRawBridgeAdapter
 from backend.models import (
     BUNDLE_RULE_KINDS,
     BUNDLE_RULE_TCP_FORWARD,
+    BUNDLE_RULE_TCP_RELAY,
     BUNDLE_RULE_UDP_BROADCAST_FORWARD,
     BUNDLE_RULE_UDP_FORWARD,
+    BUNDLE_RULE_UDP_RAW_BRIDGE,
     BUNDLE_STATUS_FAILED,
     BUNDLE_STATUS_RUNNING,
     BUNDLE_STATUS_STOPPED,
@@ -253,11 +257,52 @@ class BundleRunner:
                 "max_hop_count",
                 "recent_ttl_seconds",
                 "recent_cache_limit",
+                "route_responses_to_last_sender",
+                "strict_target_port_match",
             )
             return GenericUdpBroadcastForwardAdapter(
                 profile,
                 self._transport_factory(rule),
                 **options,
+            )
+        if rule.kind == BUNDLE_RULE_TCP_RELAY:
+            if self._transport_factory is None:
+                raise ValueError(
+                    "tcp_relay requires a transport_factory"
+                )
+            profile = _profile_from_rule(rule)
+            options = _selected_options(
+                rule.config,
+                "connection_timeout",
+                "chunk_size",
+                "max_inflight_frames",
+                "retransmit_interval",
+            )
+            return TcpRelayAdapter(
+                profile=profile,
+                transport=self._transport_factory(rule),
+                **options,
+            )
+        if rule.kind == BUNDLE_RULE_UDP_RAW_BRIDGE:
+            if self._transport_factory is None:
+                raise ValueError(
+                    "udp_raw_bridge requires a transport_factory"
+                )
+            fixed_local_target_addr = None
+            profile = _profile_from_rule(rule)
+            if (
+                profile.remote_target_host
+                and profile.remote_target_port is not None
+                and profile.remote_target_port > 0
+            ):
+                fixed_local_target_addr = (
+                    profile.remote_target_host,
+                    profile.remote_target_port,
+                )
+            return UdpRawBridgeAdapter(
+                profile=profile,
+                transport=self._transport_factory(rule),
+                fixed_local_target_addr=fixed_local_target_addr,
             )
         raise ValueError(f"Unsupported bundle rule kind: {rule.kind}")
 
@@ -269,7 +314,7 @@ def _profile_from_rule(rule: BundleRule) -> GameProfile:
         display_name=rule.id,
         exe_path="",
         adapter_type=rule.kind,
-        protocol="tcp" if rule.kind == BUNDLE_RULE_TCP_FORWARD else "udp",
+        protocol="tcp" if rule.kind in {BUNDLE_RULE_TCP_FORWARD, BUNDLE_RULE_TCP_RELAY} else "udp",
         local_bind_host=str(config.get("local_bind_host", "127.0.0.1")),
         local_bind_port=_optional_int(config.get("local_bind_port", 0)),
         remote_target_host=str(config.get("remote_target_host", "")),

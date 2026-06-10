@@ -11,11 +11,13 @@ from adapters.udp_adapter import GenericUdpForwardAdapter
 from adapters.udp_broadcast_forward_adapter import (
     GenericUdpBroadcastForwardAdapter,
 )
+from adapters.udp_raw_bridge_adapter import UdpRawBridgeAdapter
 from backend.bundle_runner import BundleRunner
 from backend.models import (
     BUNDLE_STATUS_FAILED,
     BUNDLE_STATUS_RUNNING,
     BUNDLE_STATUS_STOPPED,
+    BUNDLE_RULE_UDP_RAW_BRIDGE,
     BundleConfig,
     BundleRule,
 )
@@ -225,6 +227,32 @@ class BundleRunnerLifecycleTests(unittest.TestCase):
             runner._started[0][1],
             GenericUdpBroadcastForwardAdapter,
         )
+
+    def test_udp_raw_bridge_rule_uses_new_adapter(self):
+        transports = []
+
+        def transport_factory(rule):
+            local, _ = make_fake_pair()
+            transports.append(local)
+            return local
+
+        runner = BundleRunner(transport_factory=transport_factory)
+        result = runner.start(BundleConfig(
+            id="raw-bridge",
+            rules=[_rule(
+                "raw",
+                BUNDLE_RULE_UDP_RAW_BRIDGE,
+                local_bind_host="127.0.0.1",
+                local_bind_port=0,
+                remote_target_host="127.0.0.1",
+                remote_target_port=9,
+            )],
+        ))
+        self.addCleanup(runner.stop)
+
+        self.assertEqual(result.status, BUNDLE_STATUS_RUNNING)
+        self.assertEqual(len(transports), 1)
+        self.assertIsInstance(runner._started[0][1], UdpRawBridgeAdapter)
 
     def test_stop_is_idempotent(self):
         events = []

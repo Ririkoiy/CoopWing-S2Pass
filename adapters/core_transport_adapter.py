@@ -84,7 +84,7 @@ class CoreTransportAdapter(Transport):
     def get_payload_diagnostics(self) -> Dict[str, Any]:
         """Return transport-layer diagnostics for live debugging."""
         core = self._core
-        return {
+        diagnostics: Dict[str, Any] = {
             # -- CoreTransportAdapter send diagnostics
             "cta_send_attempts": self.send_attempts,
             "cta_send_scheduled": self.send_scheduled,
@@ -111,3 +111,10 @@ class CoreTransportAdapter(Transport):
             "core_relay_drop_no_callback": core.relay_drop_no_callback,
             "core_last_relay_receive_error": core.last_relay_receive_error,
         }
+        if core.peer_ip and core.peer_port:
+            diagnostics["peer_endpoint"] = {
+                "host": core.peer_ip,
+                "port": core.peer_port,
+                "source": "core_peer_info",
+            }
+        return diagnostics

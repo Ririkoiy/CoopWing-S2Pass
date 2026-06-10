@@ -19,6 +19,7 @@ import json
 import ast
 from pathlib import Path
 
+import network_core as network_core_module
 from network_core import (
     S2PassClientCore,
     S2PassConfig,
@@ -31,6 +32,7 @@ from network_core import (
     EVT_PARTICIPANT_LEFT,
     EVT_ROOM_READY,
     EVT_ROOM_CLOSED,
+    EVT_TIMEOUT,
 )
 
 class TestRelayIpFallback(unittest.TestCase):
@@ -752,6 +754,85 @@ class TestPayloadAPI(unittest.TestCase):
 
         payload_part = remaining[newline_idx + 1:]
         self.assertEqual(payload_part, raw_payload)
+
+
+class TestV2PayloadLifecycle(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self._server = None
+
+    async def asyncTearDown(self):
+        if self._server is not None:
+            self._server.close()
+            await self._server.wait_closed()
+
+    async def test_waiting_host_room_does_not_auto_close_after_idle_timeout(self):
+        received_types = []
+
+        async def handle_client(reader, writer):
+            line = await reader.readline()
+            message = json.loads(line.decode("utf-8"))
+            received_types.append(message["type"])
+            writer.write(
+                json.dumps({
+                    "type": "ROOM_CREATED",
+                    "payload": {
+                        "room_id": "WAIT42",
+                        "player_id": "p_alice000001",
+                        "protocol_version": 2,
+                        "max_players": 4,
+                        "participants": [
+                            {
+                                "player_id": "p_alice000001",
+                                "player_name": "Alice",
+                                "is_host": True,
+                            },
+                        ],
+                        "participant_count": 1,
+                    },
+                }).encode("utf-8") + b"\n"
+            )
+            await writer.drain()
+            try:
+                while await reader.readline():
+                    pass
+            finally:
+                writer.close()
+                await writer.wait_closed()
+
+        self._server = await asyncio.start_server(handle_client, "127.0.0.1", 0)
+        port = self._server.sockets[0].getsockname()[1]
+        events = []
+        original_timeout = network_core_module.RELAY_ENABLED_TIMEOUT
+        network_core_module.RELAY_ENABLED_TIMEOUT = 0.01
+        task = None
+        core = None
+        try:
+            core = S2PassClientCore(
+                S2PassConfig(
+                    host="127.0.0.1",
+                    port=port,
+                    player_name="Alice",
+                    role="create",
+                    protocol_version=2,
+                    is_payload_mode=True,
+                    udp_reg_count=0,
+                ),
+                event_callback=events.append,
+            )
+            task = asyncio.create_task(core.run())
+            await asyncio.sleep(0.08)
+
+            self.assertFalse(task.done())
+            self.assertIn("CREATE_ROOM", received_types)
+            self.assertNotIn(EVT_TIMEOUT, [event.type for event in events])
+            self.assertEqual(core.room_id, "WAIT42")
+        finally:
+            network_core_module.RELAY_ENABLED_TIMEOUT = original_timeout
+            if task is not None:
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+            if core is not None:
+                await core.close()
 
 
 if __name__ == "__main__":

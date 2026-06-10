@@ -59,8 +59,6 @@ Under normal usage, users do not need to operate the backend manually.
 
 An adapter connects a game’s local network traffic to Co-opWinG.
 
-The current preview version focuses on UDP-related adapters. TCP support is still under development.
-
 ### Relay
 
 If direct P2P connection fails, Co-opWinG can try to forward traffic through a relay server.
@@ -147,7 +145,6 @@ You can check:
 
 Possible reasons include:
 
-* The game requires TCP, but the current test uses UDP
 * The game requires multiple ports
 * The game requires a protocol-aware adapter
 * The game still performs official server verification
@@ -197,7 +194,6 @@ The current preview version still has the following limitations:
 * Mainly targets Windows
 * Not all games are supported
 * Manual port configuration may be required
-* TCP support is still under development
 * Relay quality depends on the server and network environment
 * UI and wording are still being adjusted
 * Some features are still mainly intended for testing

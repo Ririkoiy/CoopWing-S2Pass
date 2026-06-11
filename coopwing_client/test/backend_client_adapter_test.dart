@@ -60,6 +60,9 @@ void main() {
             'relay_token_available': true,
             'relay_target_host': '127.0.0.1',
             'relay_target_port': 9001,
+            'peer_endpoint_host': '198.51.100.44',
+            'peer_endpoint_port': 42001,
+            'peer_endpoint_source': 'session_diagnostics',
             'server_time': 1716192000.5,
             'secondary_ip_enabled': true,
             'secondary_ip_fallback_used': false,
@@ -84,6 +87,9 @@ void main() {
       expect(session.relayTokenAvailable, isTrue);
       expect(session.relayTargetHost, '127.0.0.1');
       expect(session.relayTargetPort, 9001);
+      expect(session.peerEndpointHost, '198.51.100.44');
+      expect(session.peerEndpointPort, 42001);
+      expect(session.peerEndpointSource, 'session_diagnostics');
       expect(session.serverTime, 1716192000.5);
       expect(session.secondaryIpEnabled, isTrue);
       expect(session.secondaryIpFallbackUsed, isFalse);
@@ -107,6 +113,9 @@ void main() {
       expect(session.relayTokenAvailable, isFalse);
       expect(session.relayTargetHost, isNull);
       expect(session.relayTargetPort, isNull);
+      expect(session.peerEndpointHost, isNull);
+      expect(session.peerEndpointPort, isNull);
+      expect(session.peerEndpointSource, isNull);
       expect(session.serverTime, isNull);
       expect(session.secondaryIpEnabled, isFalse);
       expect(session.secondaryIpFallbackUsed, isFalse);
@@ -238,6 +247,66 @@ void main() {
         );
       },
     );
+
+    test('ready adapter_status parses discovery_helper_connection if present', () {
+      final session = SessionInfo.fromJson(
+        _sessionJson(
+          adapterStatus: {
+            'enabled': true,
+            'status': 'ready',
+            'adapter_type': 'bundle',
+            'bind_host': '127.0.0.1',
+            'bind_port': 40100,
+            'payload_diagnostics': {
+              'discovery_helper_connection': {
+                'host': '127.0.0.1',
+                'port': 40101,
+                'udp_available': true,
+              }
+            }
+          },
+        ),
+      );
+
+      final status = session.adapterStatus!;
+      expect(status.discoveryHelperConnection, isNotNull);
+      expect(status.discoveryHelperConnection!['host'], '127.0.0.1');
+      expect(status.discoveryHelperConnection!['port'], 40101);
+      expect(status.discoveryHelperConnectionAddress, '127.0.0.1:40101');
+    });
+
+    test('ready adapter_status discovery_helper_connection handles missing/disabled gracefully', () {
+      final sessionDisabled = SessionInfo.fromJson(
+        _sessionJson(
+          adapterStatus: {
+            'enabled': true,
+            'status': 'ready',
+            'adapter_type': 'bundle',
+            'payload_diagnostics': {
+              'discovery_helper_connection': {
+                'host': '127.0.0.1',
+                'port': 40101,
+                'udp_available': false,
+              }
+            }
+          },
+        ),
+      );
+      expect(sessionDisabled.adapterStatus!.discoveryHelperConnectionAddress, isNull);
+
+      final sessionMissing = SessionInfo.fromJson(
+        _sessionJson(
+          adapterStatus: {
+            'enabled': true,
+            'status': 'ready',
+            'adapter_type': 'bundle',
+            'payload_diagnostics': {}
+          },
+        ),
+      );
+      expect(sessionMissing.adapterStatus!.discoveryHelperConnection, isNull);
+      expect(sessionMissing.adapterStatus!.discoveryHelperConnectionAddress, isNull);
+    });
   });
 
   group('lan discovery models', () {
@@ -408,34 +477,29 @@ void main() {
       });
     });
 
-    test(
-      'Bundle adds local target port to join request without game port',
-      () async {
-        final capture = await _withCaptureServer((client) {
-          return client.joinSession(
-            serverHost: '127.0.0.1',
-            serverPort: 9000,
-            serverUdpPort: 9001,
-            roomId: 'ABC234',
-            playerName: 'Bob',
-            gameServerHost: '127.0.0.1',
-            adapterConfig: AdapterConfig.bundle(targetPort: 27015),
-          );
-        });
+    test('Bundle no-target adds expected adapter_config to join request', () async {
+      final capture = await _withCaptureServer((client) {
+        return client.joinSession(
+          serverHost: '127.0.0.1',
+          serverPort: 9000,
+          serverUdpPort: 9001,
+          roomId: 'ABC234',
+          playerName: 'Bob',
+          gameServerHost: '127.0.0.1',
+          adapterConfig: AdapterConfig.bundle(targetPort: 0),
+        );
+      });
 
-        expect(capture.body.containsKey('game_server_port'), isFalse);
-        expect(
-          (capture.body['adapter_config']
-              as Map<String, Object?>)['adapter_type'],
-          'bundle',
-        );
-        expect(
-          (capture.body['adapter_config']
-              as Map<String, Object?>)['target_port'],
-          27015,
-        );
-      },
-    );
+      expect(capture.body.containsKey('game_server_port'), isFalse);
+      expect(
+        (capture.body['adapter_config'] as Map<String, Object?>)['adapter_type'],
+        'bundle',
+      );
+      expect(
+        (capture.body['adapter_config'] as Map<String, Object?>)['target_port'],
+        0,
+      );
+    });
 
     test('UDP Only adds expected adapter_config to join request', () async {
       final capture = await _withCaptureServer((client) {
@@ -864,6 +928,285 @@ void _gameApiHttpTests() {
       }
     }
     client.dispose();
+  });
+
+  group('Bundle traffic display', () {
+    test('AdapterStatus parses Bundle rules safely', () {
+      final status = AdapterStatus.fromJson({
+        'enabled': true,
+        'status': 'ready',
+        'adapter_type': 'bundle',
+        'bind_host': '127.0.0.1',
+        'bind_port': 40001,
+        'target_host': '127.0.0.1',
+        'target_port': 27015,
+        'counters': {
+          'packets_from_game': 100,
+          'packets_to_transport': 100,
+          'packets_from_transport': 80,
+          'packets_to_game': 80,
+        },
+        'payload_diagnostics': {
+          'rules': [
+            {
+              'id': 'tcp_relay',
+              'kind': 'tcp_relay',
+              'running': true,
+              'stats': {
+                'packets_from_game': 50,
+                'packets_to_transport': 50,
+                'packets_from_transport': 40,
+                'packets_to_game': 40,
+              },
+            },
+            {
+              'id': 'udp_raw',
+              'kind': 'udp_raw_bridge',
+              'running': true,
+              'stats': {
+                'packets_from_game': 50,
+                'packets_to_transport': 50,
+                'packets_from_transport': 40,
+                'packets_to_game': 40,
+              },
+            },
+            {
+              'id': 'broadcast',
+              'kind': 'udp_broadcast_forward',
+              'running': true,
+              'stats': {
+                'packets_from_game': 10,
+                'packets_to_transport': 10,
+                'packets_from_transport': 5,
+                'packets_to_game': 5,
+              },
+            },
+          ],
+        },
+      });
+
+      expect(status.rules, hasLength(3));
+      expect(status.getRuleByKind('tcp_relay'), isNotNull);
+      expect(status.getRuleByKind('udp_raw_bridge'), isNotNull);
+      expect(status.getRuleByKind('udp_broadcast_forward'), isNotNull);
+      expect(status.isRuleRunning('tcp_relay'), isTrue);
+      expect(status.isRuleRunning('udp_raw_bridge'), isTrue);
+      expect(status.isRuleRunning('udp_broadcast_forward'), isTrue);
+
+      final tcpCounters = status.getRuleCounters('tcp_relay');
+      expect(tcpCounters, isNotNull);
+      expect(tcpCounters!.packetsFromGame, 50);
+      expect(tcpCounters.packetsFromTransport, 40);
+
+      final udpCounters = status.getRuleCounters('udp_raw_bridge');
+      expect(udpCounters, isNotNull);
+      expect(udpCounters!.packetsFromGame, 50);
+      expect(udpCounters.packetsFromTransport, 40);
+
+      final broadcastCounters = status.getRuleCounters('udp_broadcast_forward');
+      expect(broadcastCounters, isNotNull);
+      expect(broadcastCounters!.packetsFromGame, 10);
+      expect(broadcastCounters.packetsFromTransport, 5);
+    });
+
+    test('AdapterStatus handles missing rules gracefully', () {
+      final status = AdapterStatus.fromJson({
+        'enabled': true,
+        'status': 'ready',
+        'adapter_type': 'bundle',
+        'bind_host': '127.0.0.1',
+        'bind_port': 40001,
+      });
+
+      expect(status.rules, isEmpty);
+      expect(status.getRuleByKind('tcp_relay'), isNull);
+      expect(status.getRuleCounters('tcp_relay'), isNull);
+      expect(status.isRuleRunning('tcp_relay'), isFalse);
+    });
+
+    test('AdapterStatus handles missing stats in rule', () {
+      final status = AdapterStatus.fromJson({
+        'enabled': true,
+        'status': 'ready',
+        'adapter_type': 'bundle',
+        'payload_diagnostics': {
+          'rules': [
+            {
+              'id': 'tcp_relay',
+              'kind': 'tcp_relay',
+              'running': true,
+            },
+          ],
+        },
+      });
+
+      expect(status.rules, hasLength(1));
+      expect(status.isRuleRunning('tcp_relay'), isTrue);
+      expect(status.getRuleCounters('tcp_relay'), isNull);
+    });
+
+    test('Bundle discovery_helper_connection parsed safely', () {
+      final status = AdapterStatus.fromJson({
+        'enabled': true,
+        'status': 'ready',
+        'adapter_type': 'bundle',
+        'payload_diagnostics': {
+          'discovery_helper_connection': {
+            'host': '127.0.0.1',
+            'port': 50002,
+            'udp_available': true,
+          },
+        },
+      });
+
+      expect(status.discoveryHelperConnection, isNotNull);
+      expect(status.discoveryHelperConnectionAddress, '127.0.0.1:50002');
+    });
+
+    test('Bundle local_game_connection parsed safely', () {
+      final status = AdapterStatus.fromJson({
+        'enabled': true,
+        'status': 'ready',
+        'adapter_type': 'bundle',
+        'payload_diagnostics': {
+          'local_game_connection': {
+            'host': '127.0.0.1',
+            'port': 40001,
+            'tcp_available': true,
+            'udp_available': true,
+          },
+        },
+      });
+
+      expect(status.localGameConnection, isNotNull);
+      expect(status.localGameConnectionAddress, '127.0.0.1:40001');
+    });
+
+    test('Top-level counters aggregate gameplay traffic only', () {
+      // This test documents that backend aggregates tcp_relay + udp_raw_bridge
+      // but NOT udp_broadcast_forward into top-level counters
+      final status = AdapterStatus.fromJson({
+        'enabled': true,
+        'status': 'ready',
+        'adapter_type': 'bundle',
+        'counters': {
+          'packets_from_game': 100,
+          'packets_to_transport': 100,
+          'packets_from_transport': 80,
+          'packets_to_game': 80,
+        },
+        'payload_diagnostics': {
+          'rules': [
+            {
+              'id': 'tcp_relay',
+              'kind': 'tcp_relay',
+              'running': true,
+              'stats': {
+                'packets_from_game': 50,
+                'packets_to_transport': 50,
+                'packets_from_transport': 40,
+                'packets_to_game': 40,
+              },
+            },
+            {
+              'id': 'udp_raw',
+              'kind': 'udp_raw_bridge',
+              'running': true,
+              'stats': {
+                'packets_from_game': 50,
+                'packets_to_transport': 50,
+                'packets_from_transport': 40,
+                'packets_to_game': 40,
+              },
+            },
+            {
+              'id': 'broadcast',
+              'kind': 'udp_broadcast_forward',
+              'running': true,
+              'stats': {
+                'packets_from_game': 1000,
+                'packets_to_transport': 1000,
+                'packets_from_transport': 500,
+                'packets_to_game': 500,
+              },
+            },
+          ],
+        },
+      });
+
+      // Top-level should be tcp_relay + udp_raw_bridge = 50+50=100
+      expect(status.counters!.packetsFromGame, 100);
+      expect(status.counters!.packetsFromTransport, 80);
+
+      // Discovery helper has 1000 packets but should NOT be in top-level
+      final broadcastCounters = status.getRuleCounters('udp_broadcast_forward');
+      expect(broadcastCounters!.packetsFromGame, 1000);
+    });
+
+    test('Rule-level counters override empty top-level counters', () {
+      // This prevents "game works but UI shows no packets" bug
+      final status = AdapterStatus.fromJson({
+        'enabled': true,
+        'status': 'ready',
+        'adapter_type': 'bundle',
+        'counters': {
+          'packets_from_game': 0,
+          'packets_to_transport': 0,
+          'packets_from_transport': 0,
+          'packets_to_game': 0,
+        },
+        'payload_diagnostics': {
+          'rules': [
+            {
+              'id': 'udp_raw',
+              'kind': 'udp_raw_bridge',
+              'running': true,
+              'stats': {
+                'packets_from_game': 100,
+                'packets_to_transport': 100,
+                'packets_from_transport': 80,
+                'packets_to_game': 80,
+              },
+            },
+          ],
+        },
+      });
+
+      // UI should show UDP gameplay traffic from rule-level counters
+      final udpCounters = status.getRuleCounters('udp_raw_bridge');
+      expect(udpCounters, isNotNull);
+      expect(udpCounters!.packetsFromGame, greaterThan(0));
+      expect(status.counters!.packetsFromGame, 0);
+    });
+
+    test('TCP gameplay status shown when rule running but no traffic yet', () {
+      final status = AdapterStatus.fromJson({
+        'enabled': true,
+        'status': 'ready',
+        'adapter_type': 'bundle',
+        'payload_diagnostics': {
+          'rules': [
+            {
+              'id': 'tcp_relay',
+              'kind': 'tcp_relay',
+              'running': true,
+              'stats': {
+                'packets_from_game': 0,
+                'packets_to_transport': 0,
+                'packets_from_transport': 0,
+                'packets_to_game': 0,
+              },
+            },
+          ],
+        },
+      });
+
+      expect(status.isRuleRunning('tcp_relay'), isTrue);
+      final tcpCounters = status.getRuleCounters('tcp_relay');
+      expect(tcpCounters, isNotNull);
+      expect(tcpCounters!.packetsFromGame, 0);
+      // UI should show "TCP gameplay: running / ready" instead of hiding it
+    });
   });
 }
 

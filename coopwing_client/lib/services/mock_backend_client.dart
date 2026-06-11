@@ -863,6 +863,9 @@ class MockBackendClient implements BackendClient {
       relayTokenAvailable: true,
       relayTargetHost: serverHost,
       relayTargetPort: serverUdpPort,
+      peerEndpointHost: role == 'create' ? '198.51.100.44' : '198.51.100.43',
+      peerEndpointPort: role == 'create' ? 42001 : 42000,
+      peerEndpointSource: 'mock_session_diagnostics',
       serverTime: now,
       secondaryIpEnabled:
           adapterStatus?.bindHost != null &&
@@ -888,15 +891,64 @@ class MockBackendClient implements BackendClient {
     if (!config.enabled) {
       return const AdapterStatus(enabled: false, status: 'disabled');
     }
+    final bindPort = config.bindPort > 0 ? config.bindPort : 59000;
+    final isBundle = config.adapterType == 'bundle';
+    final diag = <String, Object?>{
+      'local_game_connection': {'host': config.bindHost, 'port': bindPort},
+    };
+    if (isBundle) {
+      final broadcastPort = bindPort + 1;
+      diag['included_rule_kinds'] = [
+        'tcp_forward',
+        'udp_forward',
+        'udp_broadcast_forward',
+      ];
+      diag['udp_broadcast_bind_port'] = broadcastPort;
+      diag['udp_broadcast_lan_discovery_included'] = true;
+      diag['broadcast_only_forwarding'] = false;
+      diag['rules'] = [
+        {
+          'id': 'mock_tcp',
+          'kind': 'tcp_forward',
+          'local_bind_host': config.bindHost,
+          'local_bind_port': bindPort,
+          'remote_target_host': config.targetHost,
+          'remote_target_port': config.targetPort,
+          'running': true,
+          'stats': <String, Object?>{},
+        },
+        {
+          'id': 'mock_udp',
+          'kind': 'udp_forward',
+          'local_bind_host': config.bindHost,
+          'local_bind_port': bindPort,
+          'remote_target_host': config.targetHost,
+          'remote_target_port': config.targetPort,
+          'running': true,
+          'stats': <String, Object?>{},
+        },
+        {
+          'id': 'mock_broadcast',
+          'kind': 'udp_broadcast_forward',
+          'local_bind_host': config.bindHost,
+          'local_bind_port': broadcastPort,
+          'remote_target_host': config.targetHost,
+          'remote_target_port': config.targetPort,
+          'running': true,
+          'stats': <String, Object?>{},
+        },
+      ];
+    }
     return AdapterStatus(
       enabled: true,
       status: 'stopped',
       adapterType: config.adapterType,
       bindHost: config.bindHost,
-      bindPort: config.bindPort,
+      bindPort: bindPort,
       targetHost: config.targetHost,
       targetPort: config.targetPort,
       counters: AdapterCounters.empty(),
+      payloadDiagnostics: diag,
     );
   }
 

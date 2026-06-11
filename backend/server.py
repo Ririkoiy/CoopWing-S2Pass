@@ -606,13 +606,16 @@ class _BackendHandler(BaseHTTPRequestHandler):
         return body
 
     def _send_json(self, status: int, data: Dict[str, Any]) -> None:
-        body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-        encoded = body.encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(encoded)))
-        self.end_headers()
-        self.wfile.write(encoded)
+        try:
+            body = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
+            encoded = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+        except (ConnectionAbortedError, BrokenPipeError, ConnectionResetError):
+            pass
 
     def _send_error(
         self,

@@ -11,7 +11,9 @@ import '../services/localization.dart';
 
 enum _SessionMode { create, join }
 
-enum _AdapterMode { bundle, udpOnly, tcpOnly }
+enum AdapterMode { bundle, udpOnly, tcpOnly }
+
+typedef _AdapterMode = AdapterMode;
 
 class BackendBridgePanel extends StatefulWidget {
   const BackendBridgePanel({
@@ -97,6 +99,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
   String? _processPortHint;
   int _roomTabIndex = 0;
   bool _busy = false;
+  bool _waitingForBackend = false;
   bool _pollingSession = false;
   Timer? _sessionPollTimer;
   Timer? _healthRetryTimer;
@@ -127,14 +130,12 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
 
   bool get _canCreate =>
       !_busy &&
-      _backendOnline &&
       !_sessionStatusIsActive &&
       _hasPlayerName &&
       _hasValidGamePort;
 
   bool get _canJoin =>
       !_busy &&
-      _backendOnline &&
       !_sessionStatusIsActive &&
       _hasPlayerName &&
       _hasRoomId;
@@ -232,6 +233,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
             _RoomConnectionHeader(
               health: _health,
               busy: _busy,
+              waitingForBackend: _waitingForBackend,
               onRefresh: () => _checkHealth(),
             ),
             if (_pendingActionText != null) ...[
@@ -312,7 +314,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
                   onJoin: _joinSession,
                 ),
               ],
-              if (!_backendOnline) ...[
+              if (!_backendOnline && !_busy) ...[
                 const SizedBox(height: 10),
                 Text(
                   loc.get('backend_offline_note'),
@@ -459,13 +461,29 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
 
   Future<void> _checkHealth() async {
     await _run(() async {
-      _health = await widget.client.health();
-      if (_health.isOnline && _error?.code == 'BACKEND_OFFLINE') {
-        _error = null;
-      }
-      if (_health.isOnline) {
-        await _refreshLanDiscoveryStatusSnapshot();
-        await _refreshSecondaryIpRecommendationSnapshot();
+      try {
+        final health = await widget.client.health();
+        if (mounted) {
+          setState(() {
+            _health = health;
+            if (_health.isOnline && _error?.code == 'BACKEND_OFFLINE') {
+              _error = null;
+            }
+          });
+        }
+        if (_health.isOnline) {
+          await _refreshLanDiscoveryStatusSnapshot();
+          await _refreshSecondaryIpRecommendationSnapshot();
+        }
+      } on BackendError catch (error) {
+        if (error.code == 'BACKEND_OFFLINE') {
+          if (mounted) {
+            setState(() {
+              _health = HealthStatus.offline();
+            });
+          }
+        }
+        rethrow;
       }
     }, requireOnline: false);
   }
@@ -504,14 +522,7 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
         final playerName = _parsePlayerName();
         final roomId = _parseRequiredRoomId();
         final gameServerHost = _normalizedGameHost();
-        AdapterConfig? adapterConfig;
-        if (_hasValidGamePort) {
-          final localGamePort = int.parse(
-            _gameServerPortController.text.trim(),
-          );
-          _adapterTargetPortController.text = localGamePort.toString();
-          adapterConfig = _adapterConfigOrNull(includeTargetPort: true);
-        }
+        final adapterConfig = _joinAdapterConfig();
 
         final session = await widget.client.joinSession(
           serverHost: _serverHostController.text.trim(),
@@ -717,7 +728,19 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     });
     try {
       if (requireOnline && !_backendOnline) {
-        await _refreshHealthBeforeAction();
+        setState(() {
+          _waitingForBackend = true;
+        });
+        try {
+          await _refreshHealthBeforeAction();
+        } finally {
+          if (mounted) {
+            setState(() {
+              _waitingForBackend = false;
+              _pendingActionText = pendingText;
+            });
+          }
+        }
         if (!_backendOnline) {
           throw const BackendError(
             code: 'BACKEND_OFFLINE',
@@ -727,12 +750,29 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       }
       await action();
     } on BackendError catch (error) {
-      if (error.code == 'BACKEND_OFFLINE') {
-        _health = HealthStatus.offline();
+      if (error.code == 'SESSION_NOT_FOUND' || error.code == 'ROOM_NOT_FOUND') {
+        if (mounted) {
+          setState(() {
+            _session = null;
+            _events = const [];
+            _trafficRate = AdapterTrafficRate.zero;
+            _trafficRateCalculator.reset();
+            _error = null;
+          });
+        }
+      } else {
+        if (mounted) {
+          setState(() {
+            _error = error;
+          });
+        }
       }
-      _error = error;
     } catch (error) {
-      _error = BackendError(code: 'UI_ERROR', message: error.toString());
+      if (mounted) {
+        setState(() {
+          _error = BackendError(code: 'UI_ERROR', message: error.toString());
+        });
+      }
     } finally {
       if (mounted) {
         setState(() {
@@ -746,17 +786,49 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
   }
 
   Future<void> _refreshHealthBeforeAction() async {
-    try {
-      _health = await widget.client.health();
-      if (_health.isOnline && _error?.code == 'BACKEND_OFFLINE') {
-        _error = null;
+    final loc = Localization();
+    final startTime = DateTime.now();
+    const graceDuration = Duration(seconds: 3);
+    const pollInterval = Duration(milliseconds: 500);
+
+    while (true) {
+      try {
+        final health = await widget.client.health();
+        if (health.isOnline) {
+          if (mounted) {
+            setState(() {
+              _health = health;
+              if (_error?.code == 'BACKEND_OFFLINE') {
+                _error = null;
+              }
+            });
+          }
+          return;
+        }
+      } catch (_) {
+        // Suppress errors during grace period polling
       }
-    } on BackendError catch (error) {
-      if (error.code == 'BACKEND_OFFLINE') {
-        _health = HealthStatus.offline();
-        return;
+
+      final elapsed = DateTime.now().difference(startTime);
+      if (elapsed >= graceDuration) {
+        if (mounted) {
+          setState(() {
+            _health = HealthStatus.offline();
+          });
+        }
+        throw const BackendError(
+          code: 'BACKEND_OFFLINE',
+          message: 'BACKEND_OFFLINE',
+        );
       }
-      rethrow;
+
+      if (mounted) {
+        setState(() {
+          _pendingActionText = loc.get('connecting_to_backend');
+        });
+      }
+
+      await Future<void>.delayed(pollInterval);
     }
   }
 
@@ -792,6 +864,13 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       _mode = _SessionMode.create;
       _trafficRate = AdapterTrafficRate.zero;
       _trafficRateCalculator.reset();
+      _adapterMode = _AdapterMode.bundle;
+      _gameServerPortController.clear();
+      _adapterTargetPortController.clear();
+      _adapterTargetHostController.text = BackendBridgePanel.defaultGameBindHost;
+      _selectedProcessPortCandidate = null;
+      _processPortCandidates = const [];
+      _secondaryIpEnabledForNextSession = false;
     });
     _syncSessionPolling();
   }
@@ -803,17 +882,26 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
   }
 
   Future<void> _refreshLanDiscoveryStatusSnapshot() async {
-    _lanDiscoveryStatus = await widget.client.getLanDiscoveryStatus();
-    if (!_lanDiscoveryStatus.running) {
+    try {
+      _lanDiscoveryStatus = await widget.client.getLanDiscoveryStatus();
+      if (!_lanDiscoveryStatus.running) {
+        _lanDiscoveryPeers = const [];
+      }
+    } catch (_) {
+      _lanDiscoveryStatus = LanDiscoveryStatus.stopped();
       _lanDiscoveryPeers = const [];
     }
   }
 
   Future<void> _refreshLanDiscoveryPeersSnapshot() async {
-    final response = await widget.client.getLanDiscoveryPeers();
-    _lanDiscoveryPeers = response.peers;
-    if (!response.running && _lanDiscoveryStatus.running) {
-      await _refreshLanDiscoveryStatusSnapshot();
+    try {
+      final response = await widget.client.getLanDiscoveryPeers();
+      _lanDiscoveryPeers = response.peers;
+      if (!response.running && _lanDiscoveryStatus.running) {
+        await _refreshLanDiscoveryStatusSnapshot();
+      }
+    } catch (_) {
+      // Keep existing peers or clear them
     }
   }
 
@@ -821,8 +909,6 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     try {
       _secondaryIpRecommendation = await widget.client
           .getSecondaryIpRecommendation();
-    } on BackendError {
-      rethrow;
     } catch (error) {
       _secondaryIpRecommendation = SecondaryIpRecommendation.unavailable(
         backendAdmin: _health.backendAdmin,
@@ -905,10 +991,18 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     } on BackendError catch (error) {
       if (!mounted) return;
       setState(() {
-        if (error.code == 'BACKEND_OFFLINE') {
-          _health = HealthStatus.offline();
+        if (error.code == 'SESSION_NOT_FOUND' || error.code == 'ROOM_NOT_FOUND') {
+          _session = null;
+          _events = const [];
+          _trafficRate = AdapterTrafficRate.zero;
+          _trafficRateCalculator.reset();
+          _error = null;
+        } else {
+          if (error.code == 'BACKEND_OFFLINE') {
+            unawaited(_checkHealth());
+          }
+          _error = error;
         }
-        _error = error;
       });
     } catch (error) {
       if (!mounted) return;
@@ -1053,6 +1147,9 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
       relayTokenAvailable: session.relayTokenAvailable,
       relayTargetHost: session.relayTargetHost,
       relayTargetPort: session.relayTargetPort,
+      peerEndpointHost: session.peerEndpointHost,
+      peerEndpointPort: session.peerEndpointPort,
+      peerEndpointSource: session.peerEndpointSource,
       serverTime: session.serverTime,
       secondaryIpEnabled: session.secondaryIpEnabled,
       secondaryIpFallbackUsed: session.secondaryIpFallbackUsed,
@@ -1201,6 +1298,27 @@ class _BackendBridgePanelState extends State<BackendBridgePanel> {
     };
   }
 
+  AdapterConfig _joinAdapterConfig() {
+    final targetHost = _normalizedAdapterTargetHost();
+    final secondaryIpRequest = _secondaryIpRequestOrNull();
+    _adapterTargetHostController.text = targetHost;
+    return switch (_adapterMode) {
+      _AdapterMode.bundle => AdapterConfig.bundle(
+        targetHost: targetHost,
+        targetPort: 0,
+        secondaryIpRequest: secondaryIpRequest,
+      ),
+      _AdapterMode.udpOnly => AdapterConfig.udpExperimental(
+        targetHost: targetHost,
+        secondaryIpRequest: secondaryIpRequest,
+      ),
+      _AdapterMode.tcpOnly => AdapterConfig.tcpForward(
+        targetHost: targetHost,
+        secondaryIpRequest: secondaryIpRequest,
+      ),
+    };
+  }
+
   BackendError _actionError(String action, BackendError error) {
     if (error.code == 'BACKEND_OFFLINE' || error.code == 'INVALID_INPUT') {
       return error;
@@ -1221,11 +1339,13 @@ class _RoomConnectionHeader extends StatelessWidget {
   const _RoomConnectionHeader({
     required this.health,
     required this.busy,
+    this.waitingForBackend = false,
     required this.onRefresh,
   });
 
   final HealthStatus health;
   final bool busy;
+  final bool waitingForBackend;
   final VoidCallback onRefresh;
 
   @override
@@ -1255,7 +1375,7 @@ class _RoomConnectionHeader extends StatelessWidget {
             ],
           ),
         ),
-        _HealthBadge(health: health),
+        _HealthBadge(health: health, waitingForBackend: waitingForBackend),
         const SizedBox(width: 8),
         IconButton(
           tooltip: loc.get('refresh_health'),
@@ -1468,6 +1588,7 @@ class _ActiveSessionCard extends StatelessWidget {
     final adapterStatus = session.adapterStatus;
     final adapterBind = _adapterBindAddress(adapterStatus);
     final adapterTarget = _adapterTargetAddress(adapterStatus);
+    final localGameConn = _localGameConnectionAddress(adapterStatus);
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
@@ -1520,7 +1641,39 @@ class _ActiveSessionCard extends StatelessWidget {
               ],
             ),
           ),
-          if (adapterBind != null) ...[
+          if (localGameConn != null) ...[
+            const SizedBox(height: 10),
+            _HighlightDatum(
+              label: loc.get('local_game_connection'),
+              value: localGameConn,
+              icon: Icons.videogame_asset_outlined,
+              onCopy: onCopyAdapterBind,
+            ),
+            const SizedBox(height: 8),
+            _HelperText(text: loc.get('local_game_connection_helper')),
+            if (adapterStatus?.adapterType == 'bundle') ...[
+              const SizedBox(height: 4),
+              const _BundleGameplaySummary(),
+            ],
+          ],
+          if (adapterStatus?.adapterType == 'bundle') ...[
+            const SizedBox(height: 10),
+            _HighlightDatum(
+              label: loc.get('lan_discovery_helper'),
+              value: adapterStatus?.discoveryHelperConnectionAddress ?? loc.get('disabled_unavailable'),
+              icon: Icons.radar_outlined,
+              onCopy: adapterStatus?.discoveryHelperConnectionAddress != null
+                  ? () => Clipboard.setData(ClipboardData(text: adapterStatus!.discoveryHelperConnectionAddress!))
+                  : null,
+            ),
+            const SizedBox(height: 8),
+            _HelperText(text: loc.get('lan_discovery_helper_helper')),
+          ],
+          if (_hasParticipantSummary(session)) ...[
+            const SizedBox(height: 10),
+            _SessionParticipantsSummary(session: session),
+          ],
+          if (adapterBind != null && adapterBind != localGameConn) ...[
             const SizedBox(height: 10),
             _HighlightDatum(
               label: loc.get('label_adapter_bind'),
@@ -1549,36 +1702,12 @@ class _ActiveSessionCard extends StatelessWidget {
             const SizedBox(height: 8),
             _HelperText(text: loc.get('adapter_target_helper')),
           ],
-          const SizedBox(height: 10),
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            children: [
-              _Datum(label: loc.get('label_role'), value: session.role),
-              _Datum(label: loc.get('label_status'), value: session.status),
-              _Datum(
-                label: loc.get('label_relay_status'),
-                value: _relayStatusLabel(session.status),
-              ),
-              _Datum(
-                label: loc.get('label_backend_health'),
-                value: _backendHealthLabel(health),
-              ),
-              _Datum(
-                label: loc.get('label_session_id'),
-                value: session.sessionId,
-              ),
-              if (session.error != null)
-                _Datum(
-                  label: loc.get('label_error'),
-                  value: session.error!.message,
-                ),
-            ],
-          ),
-          if (_hasV2SessionInfo(session)) ...[
+          if (session.error != null) ...[
             const SizedBox(height: 10),
-            _SessionV2Details(session: session),
+            _SessionErrorNotice(error: session.error!),
           ],
+          const SizedBox(height: 10),
+          _SessionDetailsExpansion(session: session, health: health),
           if (_hasSecondaryIpInfo(session)) ...[
             const SizedBox(height: 10),
             _SecondaryIpDetails(session: session),
@@ -1629,6 +1758,71 @@ class _ActiveSessionCard extends StatelessWidget {
   }
 }
 
+class _BundleGameplaySummary extends StatelessWidget {
+  const _BundleGameplaySummary();
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final scheme = Theme.of(context).colorScheme;
+    final style = TextStyle(fontSize: 12, color: scheme.onSurfaceVariant);
+    return Padding(
+      padding: const EdgeInsets.only(left: 12),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          _BundleSummaryLine(label: loc.get('tcp_relay_label'), style: style),
+          const SizedBox(height: 2),
+          _BundleSummaryLine(label: loc.get('udp_gameplay_label'), style: style),
+        ],
+      ),
+    );
+  }
+}
+
+class _BundleSummaryLine extends StatelessWidget {
+  const _BundleSummaryLine({required this.label, required this.style});
+
+  final String label;
+  final TextStyle style;
+
+  @override
+  Widget build(BuildContext context) {
+    return Row(
+      children: [
+        Icon(
+          Icons.arrow_right,
+          size: 16,
+          color: Theme.of(context).colorScheme.primary,
+        ),
+        Text(label, style: style),
+      ],
+    );
+  }
+}
+
+class _SessionErrorNotice extends StatelessWidget {
+  const _SessionErrorNotice({required this.error});
+
+  final BackendError error;
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final scheme = Theme.of(context).colorScheme;
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(10),
+      decoration: BoxDecoration(
+        color: scheme.errorContainer.withValues(alpha: 0.28),
+        border: Border.all(color: scheme.error.withValues(alpha: 0.36)),
+        borderRadius: BorderRadius.circular(8),
+      ),
+      child: _Datum(label: loc.get('label_error'), value: error.message),
+    );
+  }
+}
+
 class _SessionSummary extends StatelessWidget {
   const _SessionSummary({
     required this.session,
@@ -1657,6 +1851,7 @@ class _SessionSummary extends StatelessWidget {
     final adapterStatus = session.adapterStatus;
     final adapterBind = _adapterBindAddress(adapterStatus);
     final adapterTarget = _adapterTargetAddress(adapterStatus);
+    final localGameConn = _localGameConnectionAddress(adapterStatus);
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
@@ -1677,46 +1872,45 @@ class _SessionSummary extends StatelessWidget {
             ],
           ),
           const SizedBox(height: 12),
-          Wrap(
-            spacing: 10,
-            runSpacing: 10,
-            children: [
-              _HighlightDatum(
-                label: loc.get('room_id'),
-                value: session.roomId ?? '-',
-                icon: Icons.meeting_room_outlined,
-                onCopy: session.roomId == null ? null : onCopyRoomId,
-              ),
-              _Datum(label: loc.get('label_role'), value: session.role),
-              _Datum(label: loc.get('label_status'), value: session.status),
-              _Datum(
-                label: loc.get('label_relay_status'),
-                value: _relayStatusLabel(session.status),
-              ),
-              _Datum(
-                label: loc.get('label_backend_health'),
-                value: _backendHealthLabel(health),
-              ),
-              _Datum(
-                label: loc.get('label_session_id'),
-                value: session.sessionId,
-              ),
-              if (session.error != null)
-                _Datum(
-                  label: loc.get('label_error'),
-                  value: session.error!.message,
-                ),
-            ],
+          _HighlightDatum(
+            label: loc.get('room_id'),
+            value: session.roomId ?? '-',
+            icon: Icons.meeting_room_outlined,
+            onCopy: session.roomId == null ? null : onCopyRoomId,
           ),
-          if (_hasV2SessionInfo(session)) ...[
+          if (localGameConn != null) ...[
             const SizedBox(height: 10),
-            _SessionV2Details(session: session),
+            _HighlightDatum(
+              label: loc.get('local_game_connection'),
+              value: localGameConn,
+              icon: Icons.videogame_asset_outlined,
+              onCopy: onCopyAdapterBind,
+            ),
+            const SizedBox(height: 8),
+            _HelperText(text: loc.get('local_game_connection_helper')),
+            if (adapterStatus?.adapterType == 'bundle') ...[
+              const SizedBox(height: 4),
+              const _BundleGameplaySummary(),
+            ],
           ],
-          if (_hasSecondaryIpInfo(session)) ...[
+          if (adapterStatus?.adapterType == 'bundle') ...[
             const SizedBox(height: 10),
-            _SecondaryIpDetails(session: session),
+            _HighlightDatum(
+              label: loc.get('lan_discovery_helper'),
+              value: adapterStatus?.discoveryHelperConnectionAddress ?? loc.get('disabled_unavailable'),
+              icon: Icons.radar_outlined,
+              onCopy: adapterStatus?.discoveryHelperConnectionAddress != null
+                  ? () => Clipboard.setData(ClipboardData(text: adapterStatus!.discoveryHelperConnectionAddress!))
+                  : null,
+            ),
+            const SizedBox(height: 8),
+            _HelperText(text: loc.get('lan_discovery_helper_helper')),
           ],
-          if (adapterBind != null) ...[
+          if (_hasParticipantSummary(session)) ...[
+            const SizedBox(height: 10),
+            _SessionParticipantsSummary(session: session),
+          ],
+          if (adapterBind != null && adapterBind != localGameConn) ...[
             const SizedBox(height: 10),
             _HighlightDatum(
               label: loc.get('label_adapter_bind'),
@@ -1744,6 +1938,16 @@ class _SessionSummary extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             _HelperText(text: loc.get('adapter_target_helper')),
+          ],
+          if (session.error != null) ...[
+            const SizedBox(height: 10),
+            _SessionErrorNotice(error: session.error!),
+          ],
+          const SizedBox(height: 10),
+          _SessionDetailsExpansion(session: session, health: health),
+          if (_hasSecondaryIpInfo(session)) ...[
+            const SizedBox(height: 10),
+            _SecondaryIpDetails(session: session),
           ],
           if (adapterStatus != null) ...[
             const SizedBox(height: 10),
@@ -1777,55 +1981,22 @@ class _SessionSummary extends StatelessWidget {
   }
 }
 
-class _SessionV2Details extends StatelessWidget {
-  const _SessionV2Details({required this.session});
+class _SessionParticipantsSummary extends StatelessWidget {
+  const _SessionParticipantsSummary({required this.session});
 
   final SessionInfo session;
 
   @override
   Widget build(BuildContext context) {
     final loc = Localization();
+    final players = _playersValue(session);
     final participants = session.participants;
-    final relayTarget = _relayTargetValue(session);
     return Column(
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
-        Wrap(
-          spacing: 10,
-          runSpacing: 10,
-          children: [
-            if (session.protocolVersion != null)
-              _Datum(
-                label: loc.get('protocolVersionLabel'),
-                value: _protocolLabel(session.protocolVersion!),
-              ),
-            if (_playersValue(session) != null)
-              _Datum(
-                label: loc.get('playersLabel'),
-                value: _playersValue(session)!,
-              ),
-            _Datum(
-              label: loc.get('roomReadyLabel'),
-              value: _yesNo(session.roomReady),
-            ),
-            _Datum(
-              label: loc.get('roomClosedLabel'),
-              value: _yesNo(session.roomClosed),
-            ),
-            _Datum(
-              label: loc.get('relayReadyLabel'),
-              value: _yesNo(session.relayReady),
-            ),
-            if (session.lastRoomEvent != null)
-              _Datum(
-                label: loc.get('lastRoomEventLabel'),
-                value: session.lastRoomEvent!,
-              ),
-            if (relayTarget != null)
-              _Datum(label: loc.get('relayTargetLabel'), value: relayTarget),
-          ],
-        ),
-        const SizedBox(height: 12),
+        if (players != null)
+          _Datum(label: loc.get('playersLabel'), value: players),
+        if (players != null) const SizedBox(height: 12),
         Text(
           loc.get('participantsLabel'),
           style: Theme.of(context).textTheme.titleSmall,
@@ -1850,6 +2021,99 @@ class _SessionV2Details extends StatelessWidget {
   }
 }
 
+class _SessionDetailsExpansion extends StatelessWidget {
+  const _SessionDetailsExpansion({required this.session, required this.health});
+
+  final SessionInfo session;
+  final HealthStatus health;
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final peerEndpoint = _peerEndpointValue(session);
+    final relayTarget = _relayTargetValue(session);
+    return Material(
+      color: Colors.transparent,
+      child: ExpansionTile(
+        initiallyExpanded: false,
+        tilePadding: EdgeInsets.zero,
+        childrenPadding: const EdgeInsets.only(top: 8, bottom: 8),
+        title: Text(loc.get('session_details_title')),
+        children: [
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _Datum(label: loc.get('label_role'), value: session.role),
+              _Datum(label: loc.get('label_status'), value: session.status),
+              _Datum(
+                label: loc.get('label_relay_status'),
+                value: _relayStatusLabel(session.status),
+              ),
+              _Datum(
+                label: loc.get('label_backend_health'),
+                value: _backendHealthLabel(health),
+              ),
+              _Datum(
+                label: loc.get('label_session_id'),
+                value: session.sessionId,
+              ),
+              if (session.error != null)
+                _Datum(
+                  label: loc.get('label_error'),
+                  value: session.error!.message,
+                ),
+              if (session.protocolVersion != null)
+                _Datum(
+                  label: loc.get('protocolVersionLabel'),
+                  value: _protocolLabel(session.protocolVersion!),
+                ),
+              if (session.maxPlayers != null)
+                _Datum(
+                  label: loc.get('maxPlayersLabel'),
+                  value: session.maxPlayers.toString(),
+                ),
+              if (session.participantCount != null)
+                _Datum(
+                  label: loc.get('participantCountLabel'),
+                  value: session.participantCount.toString(),
+                ),
+              if (session.hostPlayerId != null)
+                _Datum(
+                  label: loc.get('hostPlayerIdLabel'),
+                  value: session.hostPlayerId!,
+                ),
+              _Datum(
+                label: loc.get('roomReadyLabel'),
+                value: _yesNo(session.roomReady),
+              ),
+              _Datum(
+                label: loc.get('roomClosedLabel'),
+                value: _yesNo(session.roomClosed),
+              ),
+              _Datum(
+                label: loc.get('relayReadyLabel'),
+                value: _yesNo(session.relayReady),
+              ),
+              if (session.lastRoomEvent != null)
+                _Datum(
+                  label: loc.get('lastRoomEventLabel'),
+                  value: session.lastRoomEvent!,
+                ),
+              _Datum(
+                label: loc.get('peerEndpointLabel'),
+                value: peerEndpoint ?? loc.get('peerEndpointUnavailable'),
+              ),
+              if (relayTarget != null)
+                _Datum(label: loc.get('relayTargetLabel'), value: relayTarget),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _ParticipantRow extends StatelessWidget {
   const _ParticipantRow({
     required this.participant,
@@ -1868,9 +2132,7 @@ class _ParticipantRow extends StatelessWidget {
     final isHost = participant.isHost || participant.playerId == hostPlayerId;
     final isCurrent =
         currentPlayerId != null && participant.playerId == currentPlayerId;
-    final title = participant.playerName.isNotEmpty
-        ? participant.playerName
-        : (participant.playerId.isNotEmpty ? participant.playerId : '-');
+    final title = participant.playerName.isNotEmpty ? participant.playerName : '-';
     return Container(
       width: double.infinity,
       margin: const EdgeInsets.only(bottom: 8),
@@ -2206,7 +2468,11 @@ class _AdapterStatusDetails extends StatelessWidget {
         ),
         if (counters != null) ...[
           const SizedBox(height: 12),
-          _TrafficDetails(counters: counters, trafficRate: trafficRate),
+          _TrafficDetails(
+            counters: counters,
+            trafficRate: trafficRate,
+            adapterStatus: adapterStatus,
+          ),
         ],
         if (adapterStatus.error != null) ...[
           const SizedBox(height: 10),
@@ -2225,20 +2491,117 @@ class _AdapterStatusDetails extends StatelessWidget {
             ],
           ),
         ],
+        () {
+          final diag = adapterStatus.payloadDiagnostics;
+          final rulesList = diag != null ? diag['rules'] : null;
+          final List<Map<String, Object?>> rules = [];
+          if (rulesList is List) {
+            for (final item in rulesList) {
+              if (item is Map) {
+                rules.add(item.map((k, v) => MapEntry(k.toString(), v)));
+              }
+            }
+          }
+          if (rules.isEmpty) return const SizedBox.shrink();
+
+          return Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const SizedBox(height: 12),
+              ExpansionTile(
+                title: Text(loc.get('advanced_diagnostics_title')),
+                children: rules.map((rule) {
+                  final id = rule['id'] as String? ?? '-';
+                  final kind = rule['kind'] as String? ?? '-';
+                  final running = rule['running'] as bool? ?? false;
+                  final bindHost = rule['local_bind_host'] as String? ?? rule['bind_host'] ?? '-';
+                  final bindPort = rule['local_bind_port'] as int? ?? rule['bind_port'] as int? ?? 0;
+                  final targetHost = rule['remote_target_host'] as String? ?? rule['target_host'] ?? '-';
+                  final targetPort = rule['remote_target_port'] as int? ?? rule['target_port'] as int? ?? 0;
+                  final stats = rule['stats'] as Map?;
+                  final packetsFromGame = stats != null ? stats['packets_from_game'] : null;
+                  final packetsFromTransport = stats != null ? stats['packets_from_transport'] : null;
+
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Row(
+                          children: [
+                            Icon(
+                              running ? Icons.check_circle_outline : Icons.error_outline,
+                              color: running ? Colors.green : Colors.red,
+                              size: 16,
+                            ),
+                            const SizedBox(width: 8),
+                            Text(
+                              '$id ($kind)',
+                              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 4),
+                        Padding(
+                          padding: const EdgeInsets.only(left: 24),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                'Bind: $bindHost:$bindPort',
+                                style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                              ),
+                              if (targetPort > 0)
+                                Text(
+                                  'Target: $targetHost:$targetPort',
+                                  style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                                ),
+                              if (packetsFromGame != null || packetsFromTransport != null)
+                                Text(
+                                  'Packets: ${packetsFromGame ?? 0} sent, ${packetsFromTransport ?? 0} received',
+                                  style: TextStyle(fontSize: 12, color: Theme.of(context).colorScheme.onSurfaceVariant),
+                                ),
+                            ],
+                          ),
+                        ),
+                        const Divider(),
+                      ],
+                    ),
+                  );
+                }).toList(),
+              ),
+            ],
+          );
+        }(),
       ],
     );
   }
 }
 
 class _TrafficDetails extends StatelessWidget {
-  const _TrafficDetails({required this.counters, required this.trafficRate});
+  const _TrafficDetails({
+    required this.counters,
+    required this.trafficRate,
+    required this.adapterStatus,
+  });
 
   final AdapterCounters counters;
   final AdapterTrafficRate trafficRate;
+  final AdapterStatus adapterStatus;
 
   @override
   Widget build(BuildContext context) {
     final loc = Localization();
+    final isBundle = adapterStatus.adapterType == 'bundle';
+
+    if (isBundle) {
+      return _BundleTrafficDetails(
+        counters: counters,
+        trafficRate: trafficRate,
+        adapterStatus: adapterStatus,
+      );
+    }
+
     final hasTraffic =
         counters.packetsFromGame > 0 || counters.packetsFromTransport > 0;
     return Column(
@@ -2308,6 +2671,208 @@ class _TrafficDetails extends StatelessWidget {
   }
 }
 
+class _BundleTrafficDetails extends StatelessWidget {
+  const _BundleTrafficDetails({
+    required this.counters,
+    required this.trafficRate,
+    required this.adapterStatus,
+  });
+
+  final AdapterCounters counters;
+  final AdapterTrafficRate trafficRate;
+  final AdapterStatus adapterStatus;
+
+  @override
+  Widget build(BuildContext context) {
+    final loc = Localization();
+    final tcpRelayCounters = adapterStatus.getRuleCounters('tcp_relay');
+    final udpRawCounters = adapterStatus.getRuleCounters('udp_raw_bridge');
+    final broadcastCounters = adapterStatus.getRuleCounters('udp_broadcast_forward');
+
+    final tcpRunning = adapterStatus.isRuleRunning('tcp_relay');
+    final udpRunning = adapterStatus.isRuleRunning('udp_raw_bridge');
+    final broadcastRunning = adapterStatus.isRuleRunning('udp_broadcast_forward');
+
+    // Use rule-level counters if available, fallback to top-level
+    final hasTcpTraffic = tcpRelayCounters != null &&
+        (tcpRelayCounters.packetsFromGame > 0 || tcpRelayCounters.packetsFromTransport > 0);
+    final hasUdpTraffic = udpRawCounters != null &&
+        (udpRawCounters.packetsFromGame > 0 || udpRawCounters.packetsFromTransport > 0);
+    final hasBroadcastTraffic = broadcastCounters != null &&
+        (broadcastCounters.packetsFromGame > 0 || broadcastCounters.packetsFromTransport > 0);
+
+    final hasAnyGameplayTraffic = hasTcpTraffic || hasUdpTraffic ||
+        (counters.packetsFromGame > 0 || counters.packetsFromTransport > 0);
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          loc.get('gameplay_traffic'),
+          style: Theme.of(context).textTheme.titleSmall,
+        ),
+        const SizedBox(height: 8),
+
+        // TCP gameplay
+        if (tcpRelayCounters != null || tcpRunning) ...[
+          KeyedSubtree(
+            key: const Key('bundle-tcp-gameplay-section'),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  loc.get('tcp_gameplay'),
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(height: 4),
+                if (tcpRelayCounters != null && hasTcpTraffic)
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      _Datum(
+                        label: loc.get('label_game_to_relay'),
+                        value: tcpRelayCounters.packetsFromGame.toString(),
+                      ),
+                      _Datum(
+                        label: loc.get('label_relay_to_game'),
+                        value: tcpRelayCounters.packetsFromTransport.toString(),
+                      ),
+                    ],
+                  )
+                else if (tcpRunning)
+                  _HelperText(
+                    text: '${loc.get('tcp_gameplay_status')}: running / ready',
+                  )
+                else
+                  _HelperText(text: '${loc.get('tcp_gameplay_status')}: no traffic'),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+        ],
+
+        // UDP gameplay
+        if (udpRawCounters != null || udpRunning) ...[
+          KeyedSubtree(
+            key: const Key('bundle-udp-gameplay-section'),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  loc.get('udp_gameplay'),
+                  style: Theme.of(context).textTheme.labelLarge,
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  loc.get('raw_udp_gameplay'),
+                  style: Theme.of(context).textTheme.bodySmall,
+                ),
+                const SizedBox(height: 4),
+                if (udpRawCounters != null && hasUdpTraffic)
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      _Datum(
+                        label: loc.get('label_game_to_relay'),
+                        value: udpRawCounters.packetsFromGame.toString(),
+                      ),
+                      _Datum(
+                        label: loc.get('label_relay_to_game'),
+                        value: udpRawCounters.packetsFromTransport.toString(),
+                      ),
+                    ],
+                  )
+                else if (udpRunning)
+                  _HelperText(
+                    text: '${loc.get('udp_gameplay_status')}: running / ready',
+                  )
+                else
+                  _HelperText(text: '${loc.get('udp_gameplay_status')}: no traffic'),
+              ],
+            ),
+          ),
+          const SizedBox(height: 10),
+        ],
+
+        // Top-level gameplay total (only if rule counters aren't showing everything)
+        if (counters.packetsFromGame > 0 || counters.packetsFromTransport > 0) ...[
+          Text(
+            loc.get('realtime_traffic'),
+            style: Theme.of(context).textTheme.labelLarge,
+          ),
+          const SizedBox(height: 4),
+          Wrap(
+            spacing: 10,
+            runSpacing: 10,
+            children: [
+              _Datum(
+                label: loc.get('label_game_to_relay'),
+                value: _formatTrafficRate(
+                  trafficRate.gameToRelayPacketsPerSecond,
+                  trafficRate.gameToRelayKilobytesPerSecond,
+                ),
+              ),
+              _Datum(
+                label: loc.get('label_relay_to_game'),
+                value: _formatTrafficRate(
+                  trafficRate.relayToGamePacketsPerSecond,
+                  trafficRate.relayToGameKilobytesPerSecond,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+        ],
+
+        // LAN discovery helper
+        if (broadcastCounters != null || broadcastRunning) ...[
+          const Divider(),
+          const SizedBox(height: 8),
+          KeyedSubtree(
+            key: const Key('bundle-discovery-helper-section'),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  loc.get('discovery_helper_traffic'),
+                  style: Theme.of(context).textTheme.titleSmall,
+                ),
+                const SizedBox(height: 8),
+                if (broadcastCounters != null && hasBroadcastTraffic)
+                  Wrap(
+                    spacing: 10,
+                    runSpacing: 10,
+                    children: [
+                      _Datum(
+                        label: loc.get('label_game_to_relay'),
+                        value: broadcastCounters.packetsFromGame.toString(),
+                      ),
+                      _Datum(
+                        label: loc.get('label_relay_to_game'),
+                        value: broadcastCounters.packetsFromTransport.toString(),
+                      ),
+                    ],
+                  )
+                else
+                  _HelperText(
+                    text: 'LAN discovery: ${broadcastRunning ? "running" : "stopped"}',
+                  ),
+              ],
+            ),
+          ),
+          const SizedBox(height: 8),
+        ],
+
+        if (!hasAnyGameplayTraffic) ...[
+          _HelperText(text: loc.get('no_game_traffic')),
+        ],
+      ],
+    );
+  }
+}
+
 String _formatTrafficRate(double packetsPerSecond, double? kilobytesPerSecond) {
   final packets = packetsPerSecond.isFinite ? packetsPerSecond : 0;
   final packetText = '${packets.toStringAsFixed(0)} pkt/s';
@@ -2325,18 +2890,8 @@ String _formatLastSeenAge(num seconds) {
   return '${safeSeconds.round()}s ago';
 }
 
-bool _hasV2SessionInfo(SessionInfo session) {
-  return session.protocolVersion != null ||
-      session.maxPlayers != null ||
-      session.participantCount != null ||
-      session.participants.isNotEmpty ||
-      session.hostPlayerId != null ||
-      session.lastRoomEvent != null ||
-      session.roomReady ||
-      session.roomClosed ||
-      session.relayReady ||
-      session.relayTargetHost != null ||
-      session.relayTargetPort != null;
+bool _hasParticipantSummary(SessionInfo session) {
+  return _playersValue(session) != null || session.participants.isNotEmpty;
 }
 
 bool _hasSecondaryIpInfo(SessionInfo session) {
@@ -2369,6 +2924,15 @@ String? _relayTargetValue(SessionInfo session) {
     return null;
   }
   return '$host:$port';
+}
+
+String? _peerEndpointValue(SessionInfo session) {
+  final host = session.peerEndpointHost;
+  final port = session.peerEndpointPort;
+  if (host != null && host.isNotEmpty && port != null && port > 0) {
+    return '$host:$port';
+  }
+  return session.adapterStatus?.peerEndpointAddress;
 }
 
 String _yesNo(bool value) {
@@ -2973,6 +3537,7 @@ class _AdvancedBackendSettingsSection extends StatelessWidget {
               SizedBox(
                 width: 210,
                 child: DropdownButtonFormField<_AdapterMode>(
+                  key: ValueKey(adapterMode),
                   initialValue: adapterMode,
                   isExpanded: true,
                   decoration: InputDecoration(
@@ -3096,6 +3661,20 @@ String _adapterStatusLabel(AdapterStatus status) {
     'disabled' => loc.get('adapter_disabled'),
     _ => status.status.isEmpty ? loc.get('adapter_unknown') : status.status,
   };
+}
+
+String? _localGameConnectionAddress(AdapterStatus? status) {
+  final diagAddr = status?.localGameConnectionAddress;
+  if (diagAddr != null) return diagAddr;
+  final bindHost = status?.bindHost;
+  final bindPort = status?.bindPort;
+  if (status?.status != 'ready' ||
+      bindHost == null ||
+      bindPort == null ||
+      bindPort <= 0) {
+    return null;
+  }
+  return '$bindHost:$bindPort';
 }
 
 String? _adapterBindAddress(AdapterStatus? status) {
@@ -3236,14 +3815,23 @@ class _Field extends StatelessWidget {
 }
 
 class _HealthBadge extends StatelessWidget {
-  const _HealthBadge({required this.health});
+  const _HealthBadge({required this.health, this.waitingForBackend = false});
 
   final HealthStatus health;
+  final bool waitingForBackend;
 
   @override
   Widget build(BuildContext context) {
-    final color = health.isOnline ? Colors.teal : Colors.redAccent;
-    final label = _backendHealthLabel(health);
+    final loc = Localization();
+    final Color color;
+    final String label;
+    if (waitingForBackend) {
+      color = Colors.orange;
+      label = loc.get('status_reconnecting');
+    } else {
+      color = health.isOnline ? Colors.teal : Colors.redAccent;
+      label = _backendHealthLabel(health);
+    }
     return Chip(
       avatar: Icon(Icons.circle, size: 10, color: color),
       label: Text(label),

@@ -156,16 +156,22 @@ class BackendProcessManager extends ChangeNotifier {
       final process = _process!;
       process.stdout.transform(utf8.decoder).listen(sink.write);
       process.stderr.transform(utf8.decoder).listen(sink.write);
-      process.exitCode.then((code) {
+      process.exitCode.then((code) async {
         _addLog('backend process exit code: $code');
         sink?.write(
           '\n=== Backend exited with code $code at ${DateTime.now().toIso8601String()} ===\n',
         );
         sink?.close();
         if (_startedByUs && identical(_process, process)) {
-          _online = false;
           _startedByUs = false;
           _process = null;
+          final stillHealthy = await _probeHealth();
+          if (stillHealthy != null) {
+            _addLog('child process exited but another backend is healthy on target port');
+            _online = true;
+          } else {
+            _online = false;
+          }
           notifyListeners();
         }
       });

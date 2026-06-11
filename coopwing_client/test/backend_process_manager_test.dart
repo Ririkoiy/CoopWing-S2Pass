@@ -111,6 +111,45 @@ void main() {
     expect(manager.online, isFalse);
     expect(manager.startedByUs, isFalse);
   });
+
+  test('child process exits but health probe still online', () async {
+    final tempDir = await Directory.systemTemp.createTemp('coopwing_bpm_exit_health_');
+    var healthCalls = 0;
+    final process = _FakeBackendProcess();
+    final manager = BackendProcessManager(
+      backendExeLocator: () => 'coopwing_backend.exe',
+      backendDirectoryProvider: () => tempDir.path,
+      logDirectoryProvider: () => tempDir.path,
+      healthProbe: () async {
+        healthCalls += 1;
+        return healthCalls == 1 ? null : _onlineHealth();
+      },
+      processStarter:
+          (
+            exePath,
+            arguments, {
+            required workingDirectory,
+            required environment,
+          }) async {
+            return process;
+          },
+    );
+    addTearDown(() async {
+      manager.dispose();
+      await Future<void>.delayed(const Duration(milliseconds: 20));
+      await tempDir.delete(recursive: true);
+    });
+
+    await manager.ensureBackendRunning();
+    expect(manager.online, isTrue);
+    expect(manager.startedByUs, isTrue);
+
+    process.completeExit(0);
+    await Future<void>.delayed(const Duration(milliseconds: 50));
+
+    expect(manager.online, isTrue);
+    expect(manager.startedByUs, isFalse);
+  });
 }
 
 HealthStatus _onlineHealth() {
@@ -146,5 +185,11 @@ class _FakeBackendProcess implements BackendProcessHandle {
       _exit.complete(0);
     }
     return true;
+  }
+
+  void completeExit(int code) {
+    if (!_exit.isCompleted) {
+      _exit.complete(code);
+    }
   }
 }

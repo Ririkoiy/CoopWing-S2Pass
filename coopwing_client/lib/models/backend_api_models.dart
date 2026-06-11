@@ -491,6 +491,7 @@ class AdapterStatus {
     this.targetPort,
     this.counters,
     this.error,
+    this.payloadDiagnostics,
   });
 
   final bool enabled;
@@ -502,10 +503,106 @@ class AdapterStatus {
   final int? targetPort;
   final AdapterCounters? counters;
   final AdapterStatusError? error;
+  final Map<String, Object?>? payloadDiagnostics;
+
+  Map<String, Object?>? get localGameConnection {
+    final diag = payloadDiagnostics;
+    if (diag == null) return null;
+    final conn = diag['local_game_connection'];
+    if (conn is Map<String, Object?>) return conn;
+    return null;
+  }
+
+  String? get localGameConnectionAddress {
+    final conn = localGameConnection;
+    if (conn == null) return null;
+    final host = conn['host'];
+    final port = conn['port'];
+    if (host is String && port is int && port > 0) {
+      return '$host:$port';
+    }
+    return null;
+  }
+
+  Map<String, Object?>? get discoveryHelperConnection {
+    final diag = payloadDiagnostics;
+    if (diag == null) return null;
+    final conn = diag['discovery_helper_connection'];
+    if (conn is Map<String, Object?>) return conn;
+    return null;
+  }
+
+  String? get discoveryHelperConnectionAddress {
+    final conn = discoveryHelperConnection;
+    if (conn == null) return null;
+    final host = conn['host'];
+    final port = conn['port'];
+    final available = conn['udp_available'] as bool? ?? true;
+    if (!available) return null;
+    if (host is String && port is int && port > 0) {
+      return '$host:$port';
+    }
+    return null;
+  }
+
+  Map<String, Object?>? get peerEndpoint {
+    final diag = payloadDiagnostics;
+    if (diag == null) return null;
+    final endpoint = diag['peer_endpoint'] ?? diag['remote_peer_endpoint'];
+    if (endpoint is Map<String, Object?>) return endpoint;
+    return null;
+  }
+
+  String? get peerEndpointAddress {
+    final endpoint = peerEndpoint;
+    if (endpoint == null) return null;
+    final host = endpoint['host'] ?? endpoint['ip'];
+    final port = endpoint['port'];
+    if (host is String && host.isNotEmpty && port is int && port > 0) {
+      return '$host:$port';
+    }
+    return null;
+  }
+
+  List<Map<String, Object?>> get rules {
+    final diag = payloadDiagnostics;
+    if (diag == null) return const [];
+    final rulesList = diag['rules'];
+    if (rulesList is! List) return const [];
+    final List<Map<String, Object?>> result = [];
+    for (final item in rulesList) {
+      if (item is Map) {
+        result.add(item.map((k, v) => MapEntry(k.toString(), v)));
+      }
+    }
+    return result;
+  }
+
+  Map<String, Object?>? getRuleByKind(String kind) {
+    for (final rule in rules) {
+      if (rule['kind'] == kind) return rule;
+    }
+    return null;
+  }
+
+  AdapterCounters? getRuleCounters(String kind) {
+    final rule = getRuleByKind(kind);
+    if (rule == null) return null;
+    final stats = rule['stats'];
+    if (stats is! Map<String, Object?>) return null;
+    return AdapterCounters.fromJson(stats);
+  }
+
+  bool isRuleRunning(String kind) {
+    final rule = getRuleByKind(kind);
+    if (rule == null) return false;
+    return rule['running'] == true;
+  }
 
   factory AdapterStatus.fromJson(Map<String, Object?> json) {
     final countersJson = _asObjectMap(json['counters']);
     final errorJson = _asObjectMap(json['error']);
+    final diagJson = _asObjectMap(json['payload_diagnostics']);
     return AdapterStatus(
       enabled: json['enabled'] as bool? ?? false,
       status: json['status'] as String? ?? 'unknown',
@@ -518,6 +615,7 @@ class AdapterStatus {
           ? null
           : AdapterCounters.fromJson(countersJson),
       error: errorJson == null ? null : AdapterStatusError.fromJson(errorJson),
+      payloadDiagnostics: diagJson,
     );
   }
 
@@ -532,6 +630,7 @@ class AdapterStatus {
       if (targetPort != null) 'target_port': targetPort,
       if (counters != null) 'counters': counters!.toJson(),
       if (error != null) 'error': error!.toJson(),
+      if (payloadDiagnostics != null) 'payload_diagnostics': payloadDiagnostics,
     };
   }
 }
@@ -600,6 +699,9 @@ class SessionInfo {
     this.relayTokenAvailable = false,
     this.relayTargetHost,
     this.relayTargetPort,
+    this.peerEndpointHost,
+    this.peerEndpointPort,
+    this.peerEndpointSource,
     this.serverTime,
     this.secondaryIpEnabled = false,
     this.secondaryIpFallbackUsed = false,
@@ -642,6 +744,9 @@ class SessionInfo {
   final bool relayTokenAvailable;
   final String? relayTargetHost;
   final int? relayTargetPort;
+  final String? peerEndpointHost;
+  final int? peerEndpointPort;
+  final String? peerEndpointSource;
   final double? serverTime;
   final bool secondaryIpEnabled;
   final bool secondaryIpFallbackUsed;
@@ -700,6 +805,9 @@ class SessionInfo {
       ),
       relayTargetHost: _nullableAsString(json['relay_target_host']),
       relayTargetPort: _nullableAsInt(json['relay_target_port']),
+      peerEndpointHost: _nullableAsString(json['peer_endpoint_host']),
+      peerEndpointPort: _nullableAsInt(json['peer_endpoint_port']),
+      peerEndpointSource: _nullableAsString(json['peer_endpoint_source']),
       serverTime: _nullableAsDouble(json['server_time']),
       secondaryIpEnabled: _asBool(json['secondary_ip_enabled']),
       secondaryIpFallbackUsed: _asBool(json['secondary_ip_fallback_used']),
@@ -754,6 +862,10 @@ class SessionInfo {
       _snakeKey(const ['relay', 'token', 'available']): relayTokenAvailable,
       if (relayTargetHost != null) 'relay_target_host': relayTargetHost,
       if (relayTargetPort != null) 'relay_target_port': relayTargetPort,
+      if (peerEndpointHost != null) 'peer_endpoint_host': peerEndpointHost,
+      if (peerEndpointPort != null) 'peer_endpoint_port': peerEndpointPort,
+      if (peerEndpointSource != null)
+        'peer_endpoint_source': peerEndpointSource,
       if (serverTime != null) 'server_time': serverTime,
       'secondary_ip_enabled': secondaryIpEnabled,
       'secondary_ip_fallback_used': secondaryIpFallbackUsed,

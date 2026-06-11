@@ -39,7 +39,12 @@ void main() {
     expect(find.text('Creating room...'), findsOneWidget);
     await tester.pumpAndSettle();
 
+    expect(find.text('Session details'), findsOneWidget);
+    expect(find.text('session_id'), findsNothing);
+
+    await _expandSessionDetails(tester);
     expect(find.text('session_id'), findsOneWidget);
+
     expect(find.text('Current Session'), findsOneWidget);
     expect(find.text('Current Session Summary'), findsNothing);
 
@@ -93,8 +98,10 @@ void main() {
     expect(find.text('Stopping session...'), findsOneWidget);
     await tester.pumpAndSettle();
 
-    expect(find.text('stopped'), findsOneWidget);
+    expect(find.text('stopped'), findsNothing);
     expect(find.text('Current Session Summary'), findsOneWidget);
+    await _expandSessionDetails(tester);
+    expect(find.text('stopped'), findsOneWidget);
     expect(find.widgetWithText(FilledButton, 'Create Room'), findsOneWidget);
     expect(find.text('Reset local display'), findsOneWidget);
     expect(find.text('Stop Session'), findsNothing);
@@ -259,7 +266,8 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(client.lastJoinGameServerPort, isNull);
-    expect(client.lastJoinAdapterConfig, isNull);
+    expect(client.lastJoinAdapterConfig?.adapterType, 'bundle');
+    expect(client.lastJoinAdapterConfig?.targetPort, 0);
     expect(client.lastJoinServerHost, BackendBridgePanel.localPreviewRelayHost);
   });
 
@@ -350,7 +358,7 @@ void main() {
     expect(find.widgetWithText(FilledButton, 'Join Room'), findsNothing);
   });
 
-  testWidgets('Running v2 session displays participants and relay metadata', (
+  testWidgets('Running v2 session keeps participants visible and details collapsed', (
     tester,
   ) async {
     final client = MockBackendClient();
@@ -364,8 +372,7 @@ void main() {
     await tester.tap(find.widgetWithText(FilledButton, 'Create Room'));
     await tester.pumpAndSettle();
 
-    expect(find.text('Protocol'), findsOneWidget);
-    expect(find.text('v2 relay-only'), findsOneWidget);
+    expect(find.text('Local game connection'), findsOneWidget);
     expect(find.text('Players'), findsOneWidget);
     expect(find.text('3 / 4'), findsOneWidget);
     expect(find.text('Participants'), findsOneWidget);
@@ -374,13 +381,37 @@ void main() {
     expect(find.text('Carol'), findsOneWidget);
     expect(find.text('Host'), findsOneWidget);
     expect(find.text('You'), findsOneWidget);
+    expect(find.text('Session details'), findsOneWidget);
+    expect(find.text('Protocol'), findsNothing);
+    expect(find.text('v2 relay-only'), findsNothing);
+    expect(find.text('Host player ID'), findsNothing);
+    expect(find.text('p_mock_alice'), findsNothing);
+    expect(find.text('Room ready'), findsNothing);
+    expect(find.text('Relay ready'), findsNothing);
+    expect(find.text('Last room event'), findsNothing);
+    expect(find.text('Peer endpoint'), findsNothing);
+    expect(find.text('Relay target'), findsNothing);
+
+    await _expandSessionDetails(tester);
+
+    expect(find.text('Protocol'), findsOneWidget);
+    expect(find.text('v2 relay-only'), findsOneWidget);
+    expect(find.text('Max players'), findsOneWidget);
+    expect(find.text('Participant count'), findsOneWidget);
+    expect(find.text('Host player ID'), findsOneWidget);
+    expect(find.text('p_mock_alice'), findsOneWidget);
     expect(find.text('Room ready'), findsOneWidget);
     expect(find.text('Relay ready'), findsOneWidget);
     expect(find.text('Last room event'), findsOneWidget);
     expect(find.text('room_ready'), findsOneWidget);
+    expect(find.text('Peer endpoint'), findsOneWidget);
+    expect(find.text('198.51.100.44:42001'), findsOneWidget);
     expect(find.text('Relay target'), findsOneWidget);
     expect(find.text('120.27.210.184:9001'), findsOneWidget);
     expect(find.textContaining('relay_token'), findsNothing);
+
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(seconds: 1));
   });
 
   testWidgets('Stopped v2 session displays closed room state', (tester) async {
@@ -399,6 +430,11 @@ void main() {
     await tester.pumpAndSettle();
 
     expect(find.text('Current Session Summary'), findsOneWidget);
+    expect(find.text('Session details'), findsOneWidget);
+    expect(find.text('Room closed'), findsNothing);
+
+    await _expandSessionDetails(tester);
+
     expect(find.text('Room closed'), findsOneWidget);
     expect(find.text('Yes'), findsAtLeastNWidgets(1));
     expect(find.textContaining('relay_token'), findsNothing);
@@ -422,6 +458,31 @@ void main() {
     expect(find.text('Participants'), findsNothing);
     expect(find.text('No participant list yet'), findsNothing);
     expect(find.textContaining('relay_token'), findsNothing);
+  });
+
+  testWidgets('Missing peer endpoint shows unavailable without using relay', (
+    tester,
+  ) async {
+    final client = _AdapterStatusMockClient(null, v2RelayWithoutPeer: true);
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await _enterGameServerPort(tester, '27015');
+    await tester.tap(find.widgetWithText(FilledButton, 'Create Room'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Session details'), findsOneWidget);
+    expect(find.text('Peer endpoint'), findsNothing);
+
+    await _expandSessionDetails(tester);
+
+    expect(find.text('Peer endpoint'), findsOneWidget);
+    expect(find.text('Not available yet'), findsOneWidget);
+    expect(find.text('Relay target'), findsOneWidget);
+    expect(find.text('120.27.210.184:9001'), findsOneWidget);
   });
 
   testWidgets('Room Connection shows relay inactivity note', (tester) async {
@@ -1266,6 +1327,40 @@ void main() {
     expect(client.lastCreateAdapterConfig?.targetPort, 27015);
   });
 
+  testWidgets('Join UDP Only sends local_udp_bridge without game port', (
+    tester,
+  ) async {
+    final client = _CapturingMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client, initialMode: 'join'));
+    await tester.pumpAndSettle();
+    await _enterPlayerName(tester);
+    await tester.enterText(find.widgetWithText(TextField, 'Room ID'), 'MOCK42');
+    await tester.pump();
+
+    await _switchToAdvancedTab(tester);
+    await tester.ensureVisible(find.text('Advanced Backend Settings'));
+    await tester.tap(find.text('Advanced Backend Settings'));
+    await tester.pumpAndSettle();
+    await tester.ensureVisible(find.text('UDP + TCP Bundle'));
+    await tester.tap(find.text('UDP + TCP Bundle').last);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('UDP Only').last);
+    await tester.pumpAndSettle();
+
+    await _switchToRoomTab(tester);
+    await tester.tap(find.widgetWithText(FilledButton, 'Join Room'));
+    await tester.pumpAndSettle();
+
+    expect(client.lastJoinGameServerPort, isNull);
+    expect(client.lastJoinAdapterConfig?.adapterType, 'local_udp_bridge');
+    expect(client.lastJoinAdapterConfig?.adapterType, isNot('bundle'));
+    expect(client.lastJoinAdapterConfig?.targetPort, isNull);
+    expect(client.lastJoinAdapterConfig?.bindHost, '127.0.0.1');
+    expect(client.lastJoinAdapterConfig?.bindPort, 0);
+  });
+
   testWidgets('Force Relay is visible and enabled by default', (tester) async {
     final client = _CapturingMockClient();
     addTearDown(client.dispose);
@@ -1297,7 +1392,7 @@ void main() {
     expect(client.lastCreateForceRelay, isFalse);
   });
 
-  testWidgets('Join request uses relay defaults without game port', (
+  testWidgets('Join request uses explicit Bundle config without game port', (
     tester,
   ) async {
     final client = _CapturingMockClient();
@@ -1323,10 +1418,11 @@ void main() {
     );
     expect(client.lastJoinForceRelay, isTrue);
     expect(client.lastJoinGameServerPort, isNull);
-    expect(client.lastJoinAdapterConfig, isNull);
+    expect(client.lastJoinAdapterConfig?.adapterType, 'bundle');
+    expect(client.lastJoinAdapterConfig?.targetPort, 0);
   });
 
-  testWidgets('Join request sends local TCP port without game_server_port', (
+  testWidgets('Join TCP Only sends explicit config without game_server_port', (
     tester,
   ) async {
     final client = _CapturingMockClient();
@@ -1349,7 +1445,6 @@ void main() {
     await tester.tap(find.text('TCP Only').last);
     await tester.pumpAndSettle();
 
-    await _enterGameServerPort(tester, '25565');
     await _switchToRoomTab(tester);
     tester
         .widget<FilledButton>(find.widgetWithText(FilledButton, 'Join Room'))
@@ -1359,7 +1454,7 @@ void main() {
 
     expect(client.lastJoinGameServerPort, isNull);
     expect(client.lastJoinAdapterConfig?.adapterType, 'tcp_forward');
-    expect(client.lastJoinAdapterConfig?.targetPort, 25565);
+    expect(client.lastJoinAdapterConfig?.targetPort, isNull);
     expect(client.lastJoinAdapterConfig?.bindHost, '127.0.0.1');
     expect(client.lastJoinAdapterConfig?.bindPort, 0);
   });
@@ -1422,13 +1517,12 @@ void main() {
       final joinButton = find.widgetWithText(FilledButton, 'Join Room');
       expect(tester.widget<FilledButton>(joinButton).onPressed, isNotNull);
 
-      await _enterGameServerPort(tester, '27015');
       await tester.tap(joinButton);
       await tester.pumpAndSettle();
 
       expect(client.lastJoinGameServerPort, isNull);
       expect(client.lastJoinAdapterConfig?.adapterType, 'bundle');
-      expect(client.lastJoinAdapterConfig?.targetPort, 27015);
+      expect(client.lastJoinAdapterConfig?.targetPort, 0);
       expect(client.lastJoinAdapterConfig?.bindHost, '127.0.0.1');
       expect(client.lastJoinAdapterConfig?.bindPort, 0);
     },
@@ -1533,12 +1627,12 @@ void main() {
       ),
       [
         'Ready',
-        'Local connection address',
+        'Local game connection',
         '127.0.0.1:40100',
         'Game server address',
         '127.0.0.1:27015',
         'The VPS/Relay address is for CoopWing only. Do not put it directly into the game connect command.',
-        'Game clients should connect to the local connection address, for example connect 127.0.0.1:40100',
+        'Point the game connect command here, for example connect 127.0.0.1:port.',
         'Realtime Traffic',
         'Cumulative Packets',
         'Game -> Relay',
@@ -1798,10 +1892,373 @@ void main() {
       ),
       [
         'VPS/Relay 地址只供 CoopWing 使用，不应直接填进游戏 connect 命令。',
-        '游戏客户端应连接本机连接地址，例如 connect 127.0.0.1:40100',
+        '将游戏 connect 命令指向此地址，例如 connect 127.0.0.1:端口。',
         '未检测到游戏流量。请确认游戏连接的是本机连接地址。',
       ],
     );
+  });
+
+  testWidgets('Same lifecycle mode switching', (tester) async {
+    final client = _CapturingMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await _enterGameServerPort(tester, '27015');
+
+    await _expandAdvancedSettings(tester);
+    await tester.ensureVisible(find.byType(DropdownButtonFormField<AdapterMode>));
+    await tester.tap(find.byType(DropdownButtonFormField<AdapterMode>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('UDP Only').last);
+    await tester.pumpAndSettle();
+
+    await _switchToRoomTab(tester);
+    await tester.tap(find.widgetWithText(FilledButton, 'Create Room'));
+    await tester.pumpAndSettle();
+
+    expect(client.lastCreateAdapterConfig?.adapterType, 'local_udp_bridge');
+
+    await tester.ensureVisible(find.text('Stop Session'));
+    await tester.tap(find.text('Stop Session'));
+    await tester.pumpAndSettle();
+
+    await _expandAdvancedSettings(tester);
+    await tester.ensureVisible(find.byType(DropdownButtonFormField<AdapterMode>));
+    await tester.tap(find.byType(DropdownButtonFormField<AdapterMode>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('UDP + TCP Bundle').last);
+    await tester.pumpAndSettle();
+
+    await _switchToRoomTab(tester);
+    await tester.tap(find.widgetWithText(FilledButton, 'Create Room'));
+    await tester.pumpAndSettle();
+
+    expect(client.lastCreateAdapterConfig?.adapterType, 'bundle');
+  });
+
+  testWidgets('Bundle UI display maps TCP gameplay from tcp_relay diagnostics', (
+    tester,
+  ) async {
+    final client = _AdapterStatusMockClient(
+      const AdapterStatus(
+        enabled: true,
+        status: 'ready',
+        adapterType: 'bundle',
+        bindHost: '127.0.0.1',
+        bindPort: 59000,
+        counters: AdapterCounters(
+          packetsFromGame: 0,
+          packetsToTransport: 0,
+          packetsFromTransport: 0,
+          packetsToGame: 0,
+        ),
+        payloadDiagnostics: {
+          'local_game_connection': {'host': '127.0.0.1', 'port': 59000},
+          'discovery_helper_connection': {
+            'host': '127.0.0.1',
+            'port': 59001,
+            'udp_available': true,
+          },
+          'rules': [
+            {
+              'id': 'mock_tcp_relay',
+              'kind': 'tcp_relay',
+              'running': true,
+              'stats': {
+                'packets_from_game': 7,
+                'packets_to_transport': 7,
+                'packets_from_transport': 5,
+                'packets_to_game': 5,
+              },
+            },
+            {
+              'id': 'mock_udp_raw',
+              'kind': 'udp_raw_bridge',
+              'running': true,
+              'stats': {
+                'packets_from_game': 2,
+                'packets_to_transport': 2,
+                'packets_from_transport': 1,
+                'packets_to_game': 1,
+              },
+            },
+            {
+              'id': 'mock_discovery',
+              'kind': 'udp_broadcast_forward',
+              'running': true,
+              'stats': {
+                'packets_from_game': 11,
+                'packets_to_transport': 11,
+                'packets_from_transport': 13,
+                'packets_to_game': 13,
+              },
+            },
+          ],
+        },
+      ),
+    );
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await _enterGameServerPort(tester, '27015');
+    await tester.tap(find.widgetWithText(FilledButton, 'Create Room'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Local game connection'), findsOneWidget);
+    expect(find.text('127.0.0.1:59000'), findsOneWidget);
+    expect(find.text('TCP: relay'), findsOneWidget);
+    expect(find.text('UDP: raw gameplay bridge'), findsOneWidget);
+
+    final tcpSection = find.byKey(const Key('bundle-tcp-gameplay-section'));
+    final udpSection = find.byKey(const Key('bundle-udp-gameplay-section'));
+    final discoverySection = find.byKey(
+      const Key('bundle-discovery-helper-section'),
+    );
+    expect(tcpSection, findsOneWidget);
+    expect(udpSection, findsOneWidget);
+    expect(discoverySection, findsOneWidget);
+    expect(
+      find.descendant(of: tcpSection, matching: find.text('TCP gameplay')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: tcpSection, matching: find.text('7')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: tcpSection, matching: find.text('5')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: udpSection, matching: find.text('UDP gameplay')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: udpSection, matching: find.text('Raw UDP gameplay')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: udpSection, matching: find.text('2')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: udpSection, matching: find.text('1')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(
+        of: discoverySection,
+        matching: find.text('Discovery helper traffic'),
+      ),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: discoverySection, matching: find.text('11')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: discoverySection, matching: find.text('13')),
+      findsOneWidget,
+    );
+    expect(
+      find.descendant(of: discoverySection, matching: find.text('7')),
+      findsNothing,
+    );
+
+    expect(find.text(Localization().get('lan_discovery_helper')), findsOneWidget);
+    expect(find.text('127.0.0.1:59001'), findsOneWidget);
+    expect(
+      find.textContaining(Localization().get('lan_discovery_helper_helper')),
+      findsOneWidget,
+    );
+  });
+
+  testWidgets('UDP Only no-target behavior', (tester) async {
+    final client = _CapturingMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await _expandAdvancedSettings(tester);
+    await tester.ensureVisible(find.byType(DropdownButtonFormField<AdapterMode>));
+    await tester.tap(find.byType(DropdownButtonFormField<AdapterMode>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('UDP Only').last);
+    await tester.pumpAndSettle();
+
+    await _switchToRoomTab(tester);
+    await tester.tap(find.text('Join Room'));
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await tester.enterText(find.widgetWithText(TextField, 'Room ID'), 'ABCDEF');
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(FilledButton, 'Join Room'));
+    await tester.pumpAndSettle();
+
+    expect(client.lastJoinAdapterConfig?.adapterType, 'local_udp_bridge');
+
+    await _expandAdvancedSettings(tester);
+    await tester.ensureVisible(find.byType(DropdownButtonFormField<AdapterMode>));
+    final dropdown = tester.widget<DropdownButtonFormField<AdapterMode>>(
+      find.byType(DropdownButtonFormField<AdapterMode>),
+    );
+    expect(dropdown.initialValue, AdapterMode.udpOnly);
+  });
+
+  testWidgets('Bundle Join no-target behavior', (tester) async {
+    final client = _CapturingMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.text('Join Room'));
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await tester.enterText(find.widgetWithText(TextField, 'Room ID'), 'ABCDEF');
+    await tester.pumpAndSettle();
+
+    await tester.tap(find.widgetWithText(FilledButton, 'Join Room'));
+    await tester.pumpAndSettle();
+
+    expect(client.lastJoinAdapterConfig?.adapterType, 'bundle');
+    expect(client.lastJoinAdapterConfig?.targetPort, 0);
+  });
+
+  testWidgets('Reset local display resets adapter mode to Bundle', (tester) async {
+    final client = MockBackendClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await _enterGameServerPort(tester, '27015');
+
+    await _expandAdvancedSettings(tester);
+    await tester.ensureVisible(find.byType(DropdownButtonFormField<AdapterMode>));
+    await tester.tap(find.byType(DropdownButtonFormField<AdapterMode>));
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('TCP Only').last);
+    await tester.pumpAndSettle();
+
+    await _switchToRoomTab(tester);
+    await tester.tap(find.widgetWithText(FilledButton, 'Create Room'));
+    await tester.pumpAndSettle();
+
+    await tester.ensureVisible(find.text('Reset local display').first);
+    await tester.tap(find.text('Reset local display').first);
+    await tester.pumpAndSettle();
+    await tester.tap(find.text('Reset').last);
+    await tester.pumpAndSettle();
+
+    await _expandAdvancedSettings(tester);
+    await tester.ensureVisible(find.byType(DropdownButtonFormField<AdapterMode>));
+    final dropdown = tester.widget<DropdownButtonFormField<AdapterMode>>(
+      find.byType(DropdownButtonFormField<AdapterMode>),
+    );
+    expect(dropdown.initialValue, AdapterMode.bundle);
+  });
+
+  testWidgets('backend offline displays neutral connecting copy and grace period success on create', (tester) async {
+    final client = _SwitchableHealthMockClient()..online = false;
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await _enterGameServerPort(tester, '27015');
+
+    await tester.tap(find.widgetWithText(FilledButton, 'Create Room'));
+    await tester.pump();
+
+    expect(find.text('Connecting to local backend...'), findsOneWidget);
+    expect(find.textContaining('Backend offline'), findsNothing);
+
+    client.online = true;
+
+    await tester.pump(const Duration(milliseconds: 500));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Current Session'), findsOneWidget);
+    expect(find.text('Connecting to local backend...'), findsNothing);
+  });
+
+  testWidgets('backend offline grace period timeout on create', (tester) async {
+    final client = _SwitchableHealthMockClient()..online = false;
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await _enterGameServerPort(tester, '27015');
+
+    await tester.tap(find.widgetWithText(FilledButton, 'Create Room'));
+    await tester.pump();
+
+    expect(find.text('Connecting to local backend...'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 3500));
+    await tester.pumpAndSettle();
+
+    expect(find.textContaining('Backend offline'), findsOneWidget);
+    expect(find.text('Connecting to local backend...'), findsNothing);
+  });
+
+  testWidgets('Secondary IP recommendation failure does not make backend offline', (tester) async {
+    final client = _FailRecommendationMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('online fake'), findsOneWidget);
+    expect(find.textContaining('Backend offline'), findsNothing);
+  });
+
+  testWidgets('LAN discovery status failure does not make backend offline', (tester) async {
+    final client = _FailLanStatusMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    expect(find.text('online fake'), findsOneWidget);
+    expect(find.textContaining('Backend offline'), findsNothing);
+  });
+
+  testWidgets('SESSION_NOT_FOUND clears stale session but does not flag offline', (tester) async {
+    final client = _NotFoundSessionMockClient();
+    addTearDown(client.dispose);
+
+    await tester.pumpWidget(_bridgeTestApp(client));
+    await tester.pumpAndSettle();
+
+    await _enterPlayerName(tester);
+    await _enterGameServerPort(tester, '27015');
+    await tester.tap(find.widgetWithText(FilledButton, 'Create Room'));
+    await tester.pumpAndSettle();
+
+    expect(find.text('Current Session'), findsOneWidget);
+
+    await tester.pump(const Duration(milliseconds: 2500));
+    await tester.pumpAndSettle();
+
+    expect(find.widgetWithText(FilledButton, 'Create Room'), findsOneWidget);
+    expect(find.text('Current Session'), findsNothing);
+    expect(find.text('online fake'), findsOneWidget);
   });
 }
 
@@ -1898,6 +2355,20 @@ Future<void> _switchToRoomTab(WidgetTester tester) async {
     await tester.ensureVisible(find.text('房间'));
     await tester.tap(find.text('房间'));
   }
+  await tester.pumpAndSettle();
+}
+
+Future<void> _expandSessionDetails(WidgetTester tester) async {
+  final details = find.text(Localization().get('session_details_title'));
+  await tester.ensureVisible(details);
+  await tester.tap(details);
+  await tester.pumpAndSettle();
+}
+
+Future<void> _expandAdvancedSettings(WidgetTester tester) async {
+  await _switchToAdvancedTab(tester);
+  await tester.ensureVisible(find.text('Advanced Backend Settings'));
+  await tester.tap(find.text('Advanced Backend Settings'));
   await tester.pumpAndSettle();
 }
 
@@ -2158,6 +2629,7 @@ Future<void> _expectAdapterDisplay(
 class _AdapterStatusMockClient extends MockBackendClient {
   _AdapterStatusMockClient(
     this.adapterStatus, {
+    this.v2RelayWithoutPeer = false,
     this.secondaryIpEnabled = false,
     this.secondaryIpFallbackUsed = false,
     this.secondaryIpWarning,
@@ -2169,6 +2641,7 @@ class _AdapterStatusMockClient extends MockBackendClient {
   });
 
   final AdapterStatus? adapterStatus;
+  final bool v2RelayWithoutPeer;
   final bool secondaryIpEnabled;
   final bool secondaryIpFallbackUsed;
   final String? secondaryIpWarning;
@@ -2246,6 +2719,12 @@ class _AdapterStatusMockClient extends MockBackendClient {
       updatedAt: _now,
       stats: SessionStats.empty(),
       adapterStatus: adapterStatus,
+      protocolVersion: v2RelayWithoutPeer ? 2 : null,
+      maxPlayers: v2RelayWithoutPeer ? 4 : null,
+      participantCount: v2RelayWithoutPeer ? 1 : null,
+      relayReady: v2RelayWithoutPeer,
+      relayTargetHost: v2RelayWithoutPeer ? serverHost : null,
+      relayTargetPort: v2RelayWithoutPeer ? serverUdpPort : null,
       secondaryIpEnabled: secondaryIpEnabled,
       secondaryIpFallbackUsed: secondaryIpFallbackUsed,
       secondaryIpWarning: secondaryIpWarning,
@@ -2255,5 +2734,40 @@ class _AdapterStatusMockClient extends MockBackendClient {
       secondaryIpInterfaceAlias: secondaryIpInterfaceAlias,
       adapterBindMode: adapterBindMode,
     );
+  }
+}
+
+class _FailRecommendationMockClient extends MockBackendClient {
+  @override
+  Future<SecondaryIpRecommendation> getSecondaryIpRecommendation() async {
+    throw const BackendError(code: 'API_ERROR', message: 'recommendation failed');
+  }
+}
+
+class _FailLanStatusMockClient extends MockBackendClient {
+  @override
+  Future<LanDiscoveryStatus> getLanDiscoveryStatus() async {
+    throw const BackendError(code: 'API_ERROR', message: 'lan status failed');
+  }
+}
+
+class _NotFoundSessionMockClient extends MockBackendClient {
+  int getStatusCalls = 0;
+
+  @override
+  Future<SessionInfo> getSessionStatus(String sessionId) async {
+    getStatusCalls++;
+    if (getStatusCalls > 1) {
+      throw const BackendError(code: 'SESSION_NOT_FOUND', message: 'session not found');
+    }
+    return super.getSessionStatus(sessionId);
+  }
+
+  @override
+  Future<List<SessionEvent>> getSessionLogs(String sessionId) async {
+    if (getStatusCalls > 1) {
+      throw const BackendError(code: 'SESSION_NOT_FOUND', message: 'session not found');
+    }
+    return super.getSessionLogs(sessionId);
   }
 }
